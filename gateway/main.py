@@ -19,6 +19,8 @@ from .proxy import DeepSeekProxy
 from .router import router
 from .semantic_cache.store import SemanticCache
 from .stats import StatsTracker
+from .telemetry import TelemetryService
+from .metrics import CostCalculator
 
 
 @asynccontextmanager
@@ -53,6 +55,11 @@ async def lifespan(app: FastAPI):
     app.state.redis = redis_client
     app.state.cache = cache
     app.state.stats = stats
+
+    cost_calculator = CostCalculator()
+    telemetry = TelemetryService(stats=stats, cost_calculator=cost_calculator)
+    app.state.telemetry = telemetry
+    logger.info("telemetry_service_initialized")
 
     index_store = create_index_store(in_memory=settings.qdrant_in_memory)
     app.state.index_store = index_store

@@ -171,12 +171,13 @@ def _deduplicate_system_messages(messages: list[dict]) -> list[dict]:
 def canonicalize_messages(
     messages: list[dict],
     max_turns: int | None = None,
+    normalize_content: bool = True,
 ) -> list[dict]:
     # 1. Strip None fields
     normalized: list[dict] = []
     for msg in messages:
         m = {k: v for k, v in msg.items() if v is not None}
-        if "content" in m and isinstance(m["content"], str):
+        if normalize_content and "content" in m and isinstance(m["content"], str):
             m["content"] = normalize_text(m["content"])
         normalized.append(m)
 
@@ -218,8 +219,15 @@ def canonicalize_prompt(
     top_p: Optional[float] = None,
     presence_penalty: Optional[float] = None,
     frequency_penalty: Optional[float] = None,
+    system_prefix: list[dict] | None = None,
+    max_turns: int | None = None,
 ) -> CanonicalPrompt:
-    canonical_messages = canonicalize_messages(messages)
+    canonical_messages = canonicalize_messages(
+        messages, max_turns=max_turns, normalize_content=True
+    )
+
+    if system_prefix:
+        canonical_messages = list(system_prefix) + canonical_messages
 
     payload: dict = {"messages": canonical_messages}
     if model:
@@ -245,6 +253,19 @@ def canonicalize_prompt(
         canonical_text=canonical_text,
         canonical_hash=canonical_hash,
     )
+
+
+def build_upstream_messages(
+    messages: list[dict],
+    system_prefix: list[dict] | None = None,
+    max_turns: int | None = None,
+) -> list[dict]:
+    result = canonicalize_messages(
+        messages, max_turns=max_turns, normalize_content=False
+    )
+    if system_prefix:
+        result = list(system_prefix) + result
+    return result
 
 
 def generate_cache_key_params(

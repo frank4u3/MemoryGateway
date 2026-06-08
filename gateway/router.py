@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from .cache.exact import ExactCache, tokens_saved_from_cached
-from .canonicalizer import canonicalize_prompt
+from .canonicalizer import build_upstream_messages, canonicalize_prompt
 from .config import settings
 from .semantic_cache import SemanticCache, SemanticCacheEntry
 from .artifact import (
@@ -93,6 +93,7 @@ from .models import (
 )
 from .proxy import DeepSeekProxy, DeepSeekUpstreamError
 from .stats import StatsTracker
+from .telemetry import TelemetryService
 
 logger = get_logger()
 router = APIRouter()
@@ -583,6 +584,46 @@ async def dashboard():
     from fastapi.responses import HTMLResponse
 
     return HTMLResponse(content=DASHBOARD_HTML)
+
+
+# ---------------------------------------------------------------------------
+# Telemetry endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/v1/telemetry/overview", response_model=TelemetryOverview)
+async def telemetry_overview(request: Request):
+    telemetry: TelemetryService = request.app.state.telemetry
+    return await telemetry.get_overall_summary()
+
+
+@router.get("/v1/telemetry/agents")
+async def telemetry_agents(request: Request):
+    telemetry: TelemetryService = request.app.state.telemetry
+    overview = await telemetry.get_overall_summary()
+    return {"agents": [a.model_dump() for a in overview.agents]}
+
+
+@router.get("/v1/telemetry/agents/{agent_id}")
+async def telemetry_agent_detail(agent_id: str, request: Request):
+    telemetry: TelemetryService = request.app.state.telemetry
+    detail = await telemetry.get_agent_detail(agent_id)
+    return detail.model_dump()
+
+
+@router.get("/v1/telemetry/rankings")
+async def telemetry_rankings(request: Request):
+    telemetry: TelemetryService = request.app.state.telemetry
+    rankings = await telemetry.get_agent_rankings()
+    return {"rankings": [r.model_dump() for r in rankings]}
+
+
+@router.get("/v1/telemetry/dashboard")
+async def telemetry_dashboard():
+    from fastapi.responses import HTMLResponse
+    from gateway.telemetry.dashboard import TELEMETRY_DASHBOARD_HTML
+
+    return HTMLResponse(content=TELEMETRY_DASHBOARD_HTML)
 
 
 def _compute_weekly_savings(daily: list[dict]) -> list[dict]:

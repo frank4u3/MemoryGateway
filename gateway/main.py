@@ -1,0 +1,151 @@
+from contextlib import asynccontextmanager
+
+import httpx
+import redis.asyncio as aioredis
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from .artifact.store import ArtifactStore
+from .cache.exact import ExactCache
+from .config import settings
+from .context.store import ContextStore
+from .indexer.qdrant_store import create_store as create_index_store
+from .logger import get_logger, setup_logging
+from .memory.store import MemoryStore
+from .memory_layer.store import MemoryLayerStore
+from .proxy import DeepSeekProxy
+from .router import router
+from .semantic_cache.store import SemanticCache
+from .stats import StatsTracker
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    setup_logging()
+    logger = get_logger()
+    logger.info(
+        "gateway_startup",
+        extra={
+            "port": settings.gateway_port,
+            "deepseek_base": settings.deepseek_base_url,
+            "redis_url": settings.redis_url,
+            "cache_ttl": settings.cache_ttl_seconds,
+        },
+    )
+
+    redis_client = aioredis.from_url(
+        settings.redis_url,
+        decode_responses=True,
+    )
+    cache = ExactCache(redis_client, ttl=settings.cache_ttl_seconds)
+    stats = StatsTracker(redis_client)
+
+    if not hasattr(app.state, "proxy") or app.state.proxy is None:
+        http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(120.0),
+            limits=httpx.Limits(max_connections=settings.max_connections),
+        )
+        app.state.proxy = DeepSeekProxy(http_client)
+        app.state._own_proxy = True
+
+    app.state.redis = redis_client
+    app.state.cache = cache
+    app.state.stats = stats
+
+    index_store = create_index_store(in_memory=settings.qdrant_in_memory)
+    app.state.index_store = index_store
+    logger.info(
+        "index_store_initialized",
+        extra={"in_memory": settings.qdrant_in_memory},
+    )
+
+    memory_store = MemoryStore(redis_client=redis_client)
+    app.state.memory_store = memory_store
+    logger.info("memory_store_initialized")
+
+    context_store = ContextStore(redis_client=redis_client, index_store=index_store)
+    app.state.context_store = context_store
+    logger.info("context_store_initialized")
+
+    artifact_store = ArtifactStore(redis_client=redis_client, index_store=index_store)
+    app.state.artifact_store = artifact_store
+    logger.info("artifact_store_initialized")
+
+    memory_layer = MemoryLayerStore(
+        redis_client=redis_client,
+        context_store=context_store,
+        artifact_store=artifact_store,
+        index_store=index_store,
+        memory_store=memory_store,
+    )
+    app.state.memory_layer = memory_layer
+    logger.info("memory_layer_initialized")
+
+    if settings.semantic_cache_enabled:
+        semantic_cache = SemanticCache(
+            location=":memory:" if settings.qdrant_in_memory else None,
+            url=None if settings.qdrant_in_memory else "localhost",
+            port=6333,
+            threshold=settings.semantic_cache_threshold,
+        )
+        app.state.semantic_cache = semantic_cache
+        logger.info(
+            "semantic_cache_initialized",
+            extra={"threshold": settings.semantic_cache_threshold},
+        )
+    else:
+        logger.info("semantic_cache_disabled")
+
+    yield
+
+    if getattr(app.state, "_own_proxy", False) and hasattr(app.state, "proxy"):
+        await app.state.proxy.client.aclose()
+    await redis_client.aclose()
+    logger.info("gateway_shutdown")
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title="Memory Gateway",
+        version="0.5.0",
+        lifespan=lifespan,
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.exception_handler(HTTPException)
+    async def http_exception_handler(request: Request, exc: HTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=exc.detail,
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(
+        request: Request, exc: RequestValidationError
+    ):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "message": str(exc),
+                    "type": "invalid_request_error",
+                    "code": "validation_error",
+                }
+            },
+        )
+
+    app.include_router(router)
+
+    return app
+
+
+app = create_app()

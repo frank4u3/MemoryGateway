@@ -134,7 +134,7 @@ def _get_agent_id(request: Request) -> str:
 
 def _get_auth_header(request: Request) -> str:
     auth = request.headers.get("Authorization", "")
-    if not auth:
+    if not auth and not settings.deepseek_api_key:
         raise HTTPException(
             status_code=401,
             detail={

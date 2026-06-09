@@ -20,15 +20,20 @@ class DeepSeekProxy:
     def __init__(self, client: httpx.AsyncClient):
         self.client = client
         self.base_url = settings.deepseek_base_url
+        self.api_key = settings.deepseek_api_key
+
+    def _headers(self, auth_header: str) -> dict:
+        key = self.api_key or (auth_header or "").removeprefix("Bearer ").strip()
+        return {
+            "Authorization": f"Bearer {key}" if key else "",
+            "Content-Type": "application/json",
+        }
 
     async def chat_completion(
         self, request_data: dict, auth_header: str
     ) -> tuple[dict, float]:
         start = time.monotonic()
-        headers = {
-            "Authorization": auth_header,
-            "Content-Type": "application/json",
-        }
+        headers = self._headers(auth_header)
         response = await self.client.post(
             f"{self.base_url}/chat/completions",
             headers=headers,
@@ -50,10 +55,7 @@ class DeepSeekProxy:
     async def chat_completion_stream(
         self, request_data: dict, auth_header: str
     ) -> AsyncIterator[bytes]:
-        headers = {
-            "Authorization": auth_header,
-            "Content-Type": "application/json",
-        }
+        headers = self._headers(auth_header)
         async with self.client.stream(
             "POST",
             f"{self.base_url}/chat/completions",

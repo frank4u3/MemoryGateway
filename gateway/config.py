@@ -3,6 +3,7 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     deepseek_base_url: str = "https://api.deepseek.com/v1"
+    deepseek_api_key: str = ""
     gateway_port: int = 8765
     log_level: str = "INFO"
     max_connections: int = 100

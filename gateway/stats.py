@@ -22,6 +22,11 @@ AGENT_REQUESTS_TPL = "stats:agent:{agent}:requests"
 COST_SPENT_KEY = "stats:cost:spent"
 COST_SAVED_KEY = "stats:cost:saved"
 
+AGENT_TOKENS_PROMPT_TPL = "stats:agent:{agent}:tokens_prompt"
+AGENT_TOKENS_COMPLETION_TPL = "stats:agent:{agent}:tokens_completion"
+AGENT_COST_SPENT_TPL = "stats:agent:{agent}:cost_spent"
+AGENT_COST_SAVED_TPL = "stats:agent:{agent}:cost_saved"
+
 MAX_LATENCY_SAMPLES = 1000
 
 
@@ -71,6 +76,28 @@ class StatsTracker:
         pipe.incrby(
             f"stats:daily:{today}:tokens_completion", completion_tokens
         )
+        await pipe.execute()
+
+    async def record_tokens_for_agent(
+        self, agent_id: str, prompt_tokens: int, completion_tokens: int
+    ) -> None:
+        today = _today()
+        pipe = self.redis.pipeline()
+        pipe.incrby(AGENT_TOKENS_PROMPT_TPL.format(agent=agent_id), prompt_tokens)
+        pipe.incrby(AGENT_TOKENS_COMPLETION_TPL.format(agent=agent_id), completion_tokens)
+        pipe.incrby(f"stats:daily:{today}:agent:{agent_id}:tokens_prompt", prompt_tokens)
+        pipe.incrby(f"stats:daily:{today}:agent:{agent_id}:tokens_completion", completion_tokens)
+        await pipe.execute()
+
+    async def record_cost_for_agent(
+        self, agent_id: str, cost_spent: float, cost_saved: float
+    ) -> None:
+        today = _today()
+        pipe = self.redis.pipeline()
+        pipe.incrbyfloat(AGENT_COST_SPENT_TPL.format(agent=agent_id), cost_spent)
+        pipe.incrbyfloat(AGENT_COST_SAVED_TPL.format(agent=agent_id), cost_saved)
+        pipe.incrbyfloat(f"stats:daily:{today}:agent:{agent_id}:cost_spent", cost_spent)
+        pipe.incrbyfloat(f"stats:daily:{today}:agent:{agent_id}:cost_saved", cost_saved)
         await pipe.execute()
 
     async def record_cost(
@@ -208,6 +235,55 @@ class StatsTracker:
         ]
 
     async def reset(self) -> None:
-        keys = await self.redis.keys("stats:*")
-        if keys:
-            await self.redis.delete(*keys)
+        cursor = 0
+        while True:
+            cursor, keys = await self.redis.scan(cursor, match="stats:*", count=100)
+            if keys:
+                await self.redis.delete(*keys)
+            if cursor == 0:
+                break
+
+    async def get_daily_baseline(self, date_str: str | None = None) -> dict:
+        if date_str is None:
+            date_str = _today()
+        keys_base = f"stats:daily:{date_str}"
+        prompt = int(await self.redis.get(f"{keys_base}:tokens_prompt") or 0)
+        completion = int(await self.redis.get(f"{keys_base}:tokens_completion") or 0)
+        requests = int(await self.redis.get(f"{keys_base}:requests") or 0)
+        hits = int(await self.redis.get(f"{keys_base}:hits") or 0)
+        misses = int(await self.redis.get(f"{keys_base}:misses") or 0)
+        tokens_saved = int(await self.redis.get(f"{keys_base}:tokens_saved") or 0)
+        cost_spent = float(await self.redis.get(f"{keys_base}:cost_spent") or 0)
+        cost_saved = float(await self.redis.get(f"{keys_base}:cost_saved") or 0)
+
+        agents = {}
+        for agent_id in ["hermes", "opencode", "qoder", "vscode"]:
+            a_req = int(await self.redis.get(f"{keys_base}:agent_requests:{agent_id}") or 0)
+            if a_req == 0:
+                a_req = int(await self.redis.get(f"{keys_base}:requests") or 0)
+            a_prompt = int(await self.redis.get(f"{keys_base}:agent:{agent_id}:tokens_prompt") or 0)
+            a_completion = int(await self.redis.get(f"{keys_base}:agent:{agent_id}:tokens_completion") or 0)
+            a_spent = float(await self.redis.get(f"{keys_base}:agent:{agent_id}:cost_spent") or 0)
+            a_saved = float(await self.redis.get(f"{keys_base}:agent:{agent_id}:cost_saved") or 0)
+            agents[agent_id] = {
+                "tokens_prompt": a_prompt,
+                "tokens_completion": a_completion,
+                "total_tokens": a_prompt + a_completion,
+                "cost_spent_usd": round(a_spent, 8),
+                "cost_saved_usd": round(a_saved, 8),
+            }
+
+        return {
+            "date": date_str,
+            "requests": requests,
+            "hits": hits,
+            "misses": misses,
+            "tokens_prompt": prompt,
+            "tokens_completion": completion,
+            "total_tokens": prompt + completion,
+            "tokens_saved": tokens_saved,
+            "cost_spent_usd": round(cost_spent, 8),
+            "cost_saved_usd": round(cost_saved, 8),
+            "net_cost_usd": round(cost_saved - cost_spent, 8),
+            "agents": agents,
+        }

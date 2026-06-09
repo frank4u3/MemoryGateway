@@ -12,6 +12,7 @@ from .cache.exact import ExactCache
 from .config import settings
 from .context.store import ContextStore
 from .indexer.qdrant_store import create_store as create_index_store
+from .learning.store import LearningStore
 from .logger import get_logger, setup_logging
 from .memory.store import MemoryStore
 from .memory_layer.store import MemoryLayerStore
@@ -61,6 +62,11 @@ async def lifespan(app: FastAPI):
     app.state.telemetry = telemetry
     logger.info("telemetry_service_initialized")
 
+    from gateway.telemetry.baseline import BaselineService
+    baseline_service = BaselineService(redis_client=redis_client, stats=stats)
+    app.state._baseline_service = baseline_service
+    logger.info("baseline_service_initialized")
+
     index_store = create_index_store(in_memory=settings.qdrant_in_memory)
     app.state.index_store = index_store
     logger.info(
@@ -80,6 +86,10 @@ async def lifespan(app: FastAPI):
     app.state.artifact_store = artifact_store
     logger.info("artifact_store_initialized")
 
+    learning_store = LearningStore(redis_client=redis_client, index_store=index_store)
+    app.state.learning_store = learning_store
+    logger.info("learning_store_initialized")
+
     memory_layer = MemoryLayerStore(
         redis_client=redis_client,
         context_store=context_store,
@@ -89,6 +99,62 @@ async def lifespan(app: FastAPI):
     )
     app.state.memory_layer = memory_layer
     logger.info("memory_layer_initialized")
+
+    # Memory pack auto-maintenance
+    from gateway.memory.versioning import MemoryPackVersioning
+    from gateway.memory.generator import MemoryPackGenerator
+    from gateway.memory.auto_maintenance import AutoMaintenanceService, TriggerConfig
+
+    import os as _os
+    _repo_path = _os.environ.get("MEMORY_PACK_REPO_PATH", ".")
+
+    _versioning = MemoryPackVersioning(
+        base_dir=_os.environ.get("MEMORY_PACK_DIR", "memory_packs")
+    )
+    app.state._memory_pack_versioning = _versioning
+    logger.info("memory_pack_versioning_initialized")
+
+    _generator = MemoryPackGenerator()
+    _maintenance_config = TriggerConfig(
+        on_git_commit=_os.environ.get("MEMORY_PACK_TRIGGER_GIT", "true").lower() == "true",
+        on_doc_change=_os.environ.get("MEMORY_PACK_TRIGGER_DOC", "true").lower() == "true",
+        on_arch_change=_os.environ.get("MEMORY_PACK_TRIGGER_ARCH", "true").lower() == "true",
+        on_dep_change=_os.environ.get("MEMORY_PACK_TRIGGER_DEP", "true").lower() == "true",
+        min_interval_seconds=int(_os.environ.get("MEMORY_PACK_MIN_INTERVAL", "60")),
+    )
+    _auto_maintenance = AutoMaintenanceService(
+        versioning=_versioning,
+        generator=_generator,
+        trigger_config=_maintenance_config,
+        repo_path=_repo_path,
+    )
+    app.state._auto_maintenance_service = _auto_maintenance
+    logger.info("auto_maintenance_initialized")
+
+    _auto_maintenance.install_git_hook(_repo_path)
+
+    _watcher_enabled = _os.environ.get("MEMORY_PACK_WATCHER", "true").lower() == "true"
+    if _watcher_enabled:
+        from gateway.memory.watcher import FileWatcher
+        _enabled = set()
+        if _maintenance_config.on_git_commit:
+            _enabled.add("git_commit")
+        if _maintenance_config.on_doc_change:
+            _enabled.add("doc_change")
+        if _maintenance_config.on_arch_change:
+            _enabled.add("arch_change")
+        if _maintenance_config.on_dep_change:
+            _enabled.add("dep_change")
+
+        _watcher = FileWatcher(
+            repo_path=_repo_path,
+            on_trigger=_auto_maintenance.handle_trigger,
+            enabled_triggers=_enabled,
+            cooldown_seconds=_maintenance_config.min_interval_seconds,
+        )
+        await _watcher.start()
+        app.state._memory_pack_watcher = _watcher
+        logger.info("file_watcher_started")
 
     if settings.semantic_cache_enabled:
         semantic_cache = SemanticCache(
@@ -107,6 +173,8 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    if hasattr(app.state, "_memory_pack_watcher"):
+        await app.state._memory_pack_watcher.stop()
     if getattr(app.state, "_own_proxy", False) and hasattr(app.state, "proxy"):
         await app.state.proxy.client.aclose()
     await redis_client.aclose()

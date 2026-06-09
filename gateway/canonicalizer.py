@@ -45,7 +45,13 @@ TEMP_FILE_RE = re.compile(
 ABSOLUTE_PATH_RE = re.compile(
     r"(?:/(?:[a-zA-Z0-9._~\-]+))(?:(?:/[a-zA-Z0-9._~\-]+)+)"
     r"|"
-    r"(?:[a-zA-Z]:(?:\\(?:[a-zA-Z0-9._~\- ]+)){2,}\\?)",
+    r"(?:[a-zA-Z]:(?:\\(?:[a-zA-Z0-9._~\- ]+)){2,}\\?)"
+    r"|"
+    r"\\\\[a-zA-Z0-9._\-]+\\[a-zA-Z0-9._\-]+(?:\\(?:[a-zA-Z0-9._~\- ]+)){1,}\\?"
+    r"|"
+    r"(?:/mnt/[a-zA-Z]/)(?:(?:[a-zA-Z0-9._~\-]+/)+)"
+    r"|"
+    r"(?:/app/|/usr/|/srv/)(?:(?:[a-zA-Z0-9._~\-]+/)+)",
 )
 
 WHITESPACE_RE = re.compile(r"\s+")
@@ -81,6 +87,23 @@ class CanonicalPrompt:
 
 def _path_replacer(m: re.Match) -> str:
     path = m.group(0)
+
+    if path.startswith("\\\\"):
+        parts = path.strip("\\").split("\\")
+        if len(parts) >= 4:
+            remaining = "\\".join(parts[3:])
+        else:
+            remaining = "\\".join(parts)
+        return f"<workspace>\\{remaining}" if remaining else "<workspace>"
+
+    if path.startswith("/mnt/") and len(path) > 5:
+        parts = path.split("/")
+        if len(parts) >= 4:
+            remaining = "/".join(parts[4:])
+        else:
+            remaining = "/".join(parts)
+        return f"<workspace>/{remaining}" if remaining else "<workspace>"
+
     is_unix = path.startswith("/")
     sep = "/" if is_unix else "\\"
     raw_parts = path.strip(sep).split(sep)

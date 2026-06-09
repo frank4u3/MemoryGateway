@@ -58,10 +58,35 @@ class TelemetryService:
             rankings=rankings,
         )
 
-    async def get_agent_rankings(self) -> list[RankingEntry]:
-        """Return agents ranked by a composite efficiency score."""
+    async def get_agent_rankings(
+        self, sort_by: str = "composite"
+    ) -> list[RankingEntry]:
+        """Return agents ranked by a given criterion.
+
+        Supported sort_by values:
+          - composite:       custom efficiency score (default)
+          - token_consumption: most tokens used first
+          - cache_efficiency: highest hit rate first
+          - cost:            highest cost saved first
+        """
         agent_data = await self._get_agent_details()
-        return self._build_rankings(agent_data)
+        if sort_by == "token_consumption":
+            agent_data.sort(
+                key=lambda a: a.total_tokens, reverse=True
+            )
+            return self._build_rankings(agent_data, sort_by=sort_by)
+        if sort_by == "cache_efficiency":
+            agent_data.sort(
+                key=lambda a: a.hit_rate_pct, reverse=True
+            )
+            return self._build_rankings(agent_data, sort_by=sort_by)
+        if sort_by == "cost":
+            agent_data.sort(
+                key=lambda a: a.cost_saved_usd, reverse=True
+            )
+            return self._build_rankings(agent_data, sort_by=sort_by)
+        # Default: composite score
+        return self._build_rankings(agent_data, sort_by="composite")
 
     async def get_agent_detail(self, agent_id: str) -> AgentTelemetry:
         """Return detailed telemetry for a single agent."""
@@ -147,38 +172,45 @@ class TelemetryService:
         )
 
     def _build_rankings(
-        self, agent_data: list[AgentTelemetry]
+        self,
+        agent_data: list[AgentTelemetry],
+        sort_by: str = "composite",
     ) -> list[RankingEntry]:
-        """Rank agents by a composite efficiency score.
+        """Rank agents by a composite efficiency score or a specific criterion.
 
-        Score factors:
+        Score factors (composite):
           - hit_rate_pct (0-100): weight 3
           - cost_saved_usd (normalized per-request): weight 2
           - tokens_saved (normalized per-request): weight 1
           - low latency bonus: weight 1 (inverse)
         """
-        scored = []
-        for agent in agent_data:
+        def _compute_score(agent: AgentTelemetry) -> float:
             if agent.requests == 0:
-                score = 0.0
-            else:
-                # Normalized per-request metrics
-                saved_per_req = agent.tokens_saved / agent.requests
-                cost_saved_per_req = agent.cost_saved_usd / agent.requests
+                return 0.0
 
-                # Latency bonus: lower is better, cap at 5000ms
-                latency_bonus = max(0, 1.0 - (agent.avg_latency_ms / 5000.0))
+            if sort_by == "token_consumption":
+                return round(float(agent.total_tokens), 2)
+            if sort_by == "cache_efficiency":
+                return round(agent.hit_rate_pct, 2)
+            if sort_by == "cost":
+                return round(agent.cost_saved_usd, 6)
 
-                # Composite score (0-100 scale)
-                score = (
-                    (agent.hit_rate_pct * 3.0)
-                    + (min(cost_saved_per_req * 1000, 100) * 2.0)
-                    + (min(saved_per_req / 100, 100) * 1.0)
-                    + (latency_bonus * 100 * 1.0)
-                ) / 7.0
-                score = round(score, 2)
+            # Composite score (0-100 scale)
+            saved_per_req = agent.tokens_saved / agent.requests
+            cost_saved_per_req = agent.cost_saved_usd / agent.requests
+            latency_bonus = max(0, 1.0 - (agent.avg_latency_ms / 5000.0))
+            score = (
+                (agent.hit_rate_pct * 3.0)
+                + (min(cost_saved_per_req * 1000, 100) * 2.0)
+                + (min(saved_per_req / 100, 100) * 1.0)
+                + (latency_bonus * 100 * 1.0)
+            ) / 7.0
+            return round(score, 2)
 
-            scored.append((agent, agent.hit_rate_pct, score))
+        scored = [
+            (agent, agent.hit_rate_pct, _compute_score(agent))
+            for agent in agent_data
+        ]
 
         # Sort by score descending
         scored.sort(key=lambda x: x[2], reverse=True)

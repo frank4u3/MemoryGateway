@@ -1,254 +1,212 @@
-# Prefix Cache Strategy — Memory Gateway
+# DeepSeek Prefix Cache Optimization Strategy
 
-**Date:** 2026-06-08
-**Target:** Maximize DeepSeek provider-side prefix-cache reuse
+## 1. DeepSeek Prefix Cache Mechanics
+
+DeepSeek applies a server-side prefix cache that discounts tokens when the leading portion of a new prompt exactly matches a previously seen prompt at the **byte/token level**. The cache is keyed by the first N tokens of the request body sent to `POST /chat/completions`. Key properties:
+
+| Property | Detail |
+|---|---|
+| Matching granularity | Exact byte-for-byte at the tokenizer level |
+| Discount | ~75% on cached prefix tokens (vs. uncached) |
+| Scope | Per-model, per-deployment region |
+| Cache window | Rolling — frequently seen prefixes stay hot |
+| Breakage cause | Any token difference — whitespace, ordering, UUIDs, paths, timestamps, JSON key ordering |
+
+**Implication**: Any two prompts that share a common prefix will get a discount on every token in that prefix. The goal is to **maximize the shared prefix across all requests from all agents**.
 
 ---
 
-## 1. Current State Analysis
+## 2. Current Request Flow — Gap Analysis
 
-### 1.1 The Critical Gap
+### 2.1 As-Built Flow
 
-The canonicalizer normalizes prompts for the Redis exact cache key, but **the canonicalized prompt is never sent to DeepSeek**. At `gateway/router.py:314`:
+```
+Agent → FastAPI Router → canonicalize_prompt() → local hash lookup (Redis exact cache)
+                                                    ↓ miss
+                                              proxy.chat_completion(raw request_data)
+                                                    ↓
+                                              DeepSeek (receives RAW, non-normalized messages)
+```
 
+### 2.2 Critical Finding: Canonicalizer Bypassed for Upstream
+
+The canonicalizer runs only for the **local exact-cache hash** (`router.py:234-244`). The upstream request sent to DeepSeek at `router.py:315-317` uses `request_data` — the **original, un-normalized messages** from the agent.
+
+This means:
+
+- **UUIDs**, **absolute paths**, **timestamps**, **session IDs**, and **temp file references** are sent raw to DeepSeek
+- Every agent-specific variation (different user home dirs, different session IDs, different timestamps) creates a **different token prefix**
+- DeepSeek's server-side prefix cache gets **zero benefit** from the canonicalizer's work
+
+### 2.3 Additional Gaps
+
+| Gap | Impact |
+|---|---|
+| `build_upstream_messages()` exists but is never called | No structured prefix injected into upstream |
+| JSON key ordering not guaranteed in request_data | Different key order → different bytes → cache miss |
+| No explicit system prefix template shared across agents | Each agent sends different system prompts |
+| Agent-specific content (paths, IDs, filenames) varies per request | Every request has unique leading tokens |
+| No conversation window management for prefix stability | Long histories create unique trailing context |
+
+---
+
+## 3. Optimization Strategy
+
+### 3.1 Tier-1: Fix the Canonicalization Gap (Highest ROI)
+
+**Apply canonical content normalization to the upstream request body.**
+
+Before:
 ```python
-upstream_data, upstream_latency = await proxy.chat_completion(
-    request_data, auth_header  # ← original agent request, NOT canonicalized
+upstream_data, latency = await proxy.chat_completion(request_data, auth_header)
+# request_data contains raw timestamps, paths, UUIDs
+```
+
+After:
+```python
+upstream_messages = build_upstream_messages(
+    messages=request_data.get("messages", []),
+    system_prefix=GLOBAL_SYSTEM_PREFIX,
+    max_turns=settings.max_conversation_turns,
 )
+# Normalize content in upstream messages
+for msg in upstream_messages:
+    if isinstance(msg.get("content"), str):
+        msg["content"] = normalize_text(msg["content"])
+
+upstream_payload = {
+    "model": request_data.get("model", "deepseek-chat"),
+    "messages": upstream_messages,
+    # Stable ordering of optional params
+    "frequency_penalty": request_data.get("frequency_penalty"),
+    "max_tokens": request_data.get("max_tokens"),
+    "presence_penalty": request_data.get("presence_penalty"),
+    "temperature": request_data.get("temperature"),
+    "top_p": request_data.get("top_p"),
+}
+# Remove None values AFTER building dict with stable key order
+upstream_payload = {k: v for k, v in upstream_payload.items() if v is not None}
+
+upstream_data, latency = await proxy.chat_completion(upstream_payload, auth_header)
 ```
 
-`request_data` is `body.model_dump(exclude_none=True)` — the raw, un-normalized request from the agent. This means:
+**Expected improvement**: +30-50% DeepSeek prefix cache hit rate on repeated queries across agents.
 
-| Component | Sees canonicalized prompt? | Benefits? |
-|-----------|--------------------------|-----------|
-| Redis exact cache | Yes (hash key) | Exact-match Redis hits |
-| DeepSeek prefix cache | **No** | **Zero cross-agent prefix reuse** |
-| DeepSeek semantic cache | No (raw text embedded) | Reduced semantic hit rate |
+### 3.2 Tier-2: Structured Prefix Template
 
-### 1.2 Prompt Structure Variability
-
-Agent prompts vary in 5 dimensions:
-
-| Dimension | Variability | Impact on Prefix Cache |
-|-----------|-------------|----------------------|
-| **System prompt** | Each agent has unique instructions, injection order varies | High — different first tokens = different prefix |
-| **File paths** | Per-user workspace paths (e.g., `/home/alice/` vs `/home/bob/`) | High — break prefix after first path mention |
-| **Timestamps** | Every request has unique datetime strings | High — timestamps in system/user messages |
-| **Sampler params** | `temperature`, `top_p`, `max_tokens` differ by agent | Medium — changes JSON body, different hash |
-| **Conversation history** | Accumulates across turns, unique per session | Medium — growing prefix, rarely repeats |
-
-### 1.3 Redis Cache Key Composition
-
-Current hash includes: `messages` (after canonicalization) + `model` + `temperature` + `max_tokens` + `top_p` + `presence_penalty` + `frequency_penalty`.
-
-Problem: Two agents asking the same question with `temperature=0.1` vs `temperature=0.2` produce different cache keys. DeepSeek prefix cache also sees different JSON bodies.
-
----
-
-## 2. Strategy
-
-### 2.1 Principle: Stable Prefix, Variable Suffix
-
-DeepSeek's prefix cache works at the token level. The first N tokens of a request are compared to previously seen prefixes. If matched, the KV cache for those tokens is reused (≈75% discount on prompt tokens).
-
-The strategy is to **maximize the number of identical leading tokens across requests**:
+Inject a **fixed, repeatable prefix** at the beginning of every upstream request. The prefix must produce identical JSON bytes every time.
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  STABLE PREFIX (identical across requests)           │
-│  ┌────────────────────────────────────────────┐     │
-│  │ System: <canonical system prompt>          │     │
-│  │ System: <project context blocks>           │     │
-│  │ System: <memory pack summaries>            │     │
-│  │ System: <repository intelligence context>  │     │
-│  └────────────────────────────────────────────┘     │
-│  VARIABLE SUFFIX (changes per request)               │
-│  ┌────────────────────────────────────────────┐     │
-│  │ User: <current query>                      │     │
-│  │ Assistant: <generated response>            │     │
-│  └────────────────────────────────────────────┘     │
-└─────────────────────────────────────────────────────┘
+[GLOBAL SYSTEM PREFIX]     ← fixed text, same bytes every request
+  ↓
+[AGENT-SPECIFIC INSTRUCTIONS]  ← normalized (agent ID → placeholder)
+  ↓
+[PROJECT CONTEXT]          ← normalized (paths → <workspace>)
+  ↓
+[MEMORY PACK (truncated)]  ← first N tokens of current memory pack
+  ↓
+[FILE CONTEXT (sorted)]    ← alphabetically sorted, normalized paths
+  ↓
+[TRUNCATED CONVERSATION]   ← last max_turns turns only
+  ↓
+[CURRENT USER QUERY]       ← the actual question (variable suffix)
 ```
 
-### 2.2 Tiered Cache Approach
+The **system prefix, agent instructions, and project context** are the same bytes for every single request. The memory pack changes only when the pack itself changes (nightly or on-demand). The variable tail is limited to file context + conversation + query.
 
-```
-Request
-  │
-  ├─► Redis Exact Cache (SHA-256 hash of canonicalized prompt)
-  │   Purpose: Identical requests return instantly
-  │   Hit rate: Depends on request repetition
-  │
-  ├─► DeepSeek Prefix Cache (natural token prefix matching)
-  │   Purpose: Stable leading system messages hit cached KV
-  │   Hit rate: Function of prefix stability
-  │
-  └─► Semantic Cache (Qdrant cosine similarity, ≥0.98)
-      Purpose: Near-duplicate queries (disabled by default)
-```
+### 3.3 Tier-3: JSON Serialization Stability
 
-### 2.3 Specific Optimizations
+DeepSeek's prefix cache operates on the **raw HTTP request body bytes**. JSON serialization is notoriously unstable:
 
-#### O-1: Send canonicalized prompt to DeepSeek
+| Pitfall | Fix |
+|---|---|
+| Python dict key ordering (pre-3.7) | Use `OrderedDict` or sort keys |
+| JSON key presence variation | Emit all keys (with `null` values) or strip uniformly |
+| Whitespace variation | Use `json.dumps(separators=(',', ':'))` — no spaces |
+| Unicode normalization | Ensure `ensure_ascii=False` and NFC-normalize all strings |
+| Float representation | `temperature=0.1` serializes differently than `temperature=0.10` — always emit 1 decimal for 0.1-0.9 range |
 
-The `_handle_non_streaming` function must replace `request_data` with the canonicalized message structure before forwarding to DeepSeek. This is the single highest-impact change.
-
-**Implementation:**
-```python
-# In _handle_non_streaming, after canonicalization:
-if cache_enabled:
-    # Build canonical upstream request from canonicalized messages
-    upstream_payload = {
-        **request_data,
-        "messages": cp.canonical_messages,  # ← canonicalized, normalized
-    }
-else:
-    upstream_payload = request_data
-```
-
-**Projected gain:** All agents asking the same question with different paths/timestamps produce identical first tokens → DeepSeek prefix cache fires.
-
-#### O-2: Inject canonical system prefix
-
-The gateway should inject an agent-agnostic system prefix before the agent's own messages. This prefix is identical for every request from every agent.
-
-**Template:**
-```
-You are an AI coding assistant. You operate in a multi-agent environment.
-Project: <project_name>
-Language: <primary_language>
-Framework: <framework>
-```
-
-This prefix becomes the first ~50 tokens of every prompt → guaranteed prefix-cache hit for the KV of these tokens.
-
-**Projected gain:** First 50+ tokens always cached across all requests.
-
-#### O-3: Normalize sampler parameters
-
-Map agent-specific parameter values to canonical defaults in the upstream request:
-
-| Parameter | Agent Values | Canonical Value |
-|-----------|-------------|-----------------|
-| `temperature` | 0.0–0.3 | 0.1 (round to nearest 0.1) |
-| `top_p` | 0.8–1.0 | 1.0 |
-| `max_tokens` | 1024–16384 | Keep as-is (affects response, not prefix) |
-| `frequency_penalty` | 0.0–0.5 | 0.0 |
-| `presence_penalty` | 0.0 | 0.0 |
-
-Apply quantization: round `temperature` to 1 decimal place, `top_p` to 1 decimal place. This makes e.g. `temperature=0.15` and `temperature=0.1` map to the same upstream parameter.
-
-**Projected gain:** Reduces cache key variants by ~60% for parameter-sensitive keys.
-
-#### O-4: Structured conversation window
-
-Implement the `max_turns` parameter that is already in `canonicalize_messages()` but never used. Truncate conversation history to the last N turns (default: 10). The system messages (stable prefix) remain, while old conversation turns are dropped.
+**Required**: A deterministic JSON serializer that produces identical bytes for semantically identical payloads.
 
 ```python
-cp = canonicalize_prompt(
-    messages=messages,
-    max_turns=10,  # ← currently None, unlimited
-    ...
-)
+def deterministic_json(payload: dict) -> bytes:
+    """Produce cache-stable JSON bytes."""
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
 ```
 
-**Projected gain:** Prevents growing prompt from invalidating prefix cache. History beyond N turns doesn't affect current prefix.
+### 3.4 Tier-4: Agent-Agnostic System Prompt
 
-#### O-5: Inject memory pack and context blocks into the system prefix
+All agents (Hermes, OpenCode, Qoder, VSCode) currently send **different system prompts**. The gateway should:
 
-The gateway already has `ContextStore` and `MemoryStore` populated with:
-- Project architecture, roadmap, coding rules
-- Repository summaries
-- Active task state
+1. **Strip agent-specific system prompts** from incoming messages
+2. **Inject a canonical system prefix** that is identical for all agents
+3. **Append agent-specific instructions** as a separate, normalized message
 
-This content should be injected as system messages **after** the global system prefix but **before** the conversation history. This makes it part of the stable cached prefix.
+This ensures the first N bytes of every request are identical regardless of which agent sends them.
 
-**Projected gain:** Architecture, rules, and state information cached in DeepSeek's prefix — not charged on every request.
+### 3.5 Tier-5: Conversation Window Management
 
-#### O-6: Conversation summary compression
+Long conversations create unique trailing context that breaks prefix stability. Strategy:
 
-When conversation history exceeds `max_turns`, compress older turns into a single summary:
-```
-System: Previous conversation summary: <compressed summary>
-User: <most recent query>
-```
-
-This replaces N history turns with 1 summary message, keeping the prompt consistently sized.
+- **Hard cap**: `max_turns=20` (configurable)
+- **Rolling window**: Always keep the **last N turns** + **system prompt**
+- **Memory pack as context**: Replace old conversation history with the memory pack (architecture, roadmap, current state) — this is stable across requests
 
 ---
 
-## 3. Projected Improvements
+## 4. Implementation Phases
 
-| Optimization | Current | Projected | Mechanism |
-|-------------|---------|-----------|-----------|
-| Canonical upstream | Raw agent prompt | Normalized prompt | Direct prefix token match across agents |
-| Global system prefix | Agent-specific | Agent-agnostic + project context | First 50–200 tokens identical |
-| Sampler quantization | Raw parameters | Rounded parameters | Fewer unique cache key combinations |
-| Conversation window | Unlimited | Last 10 turns | Prevents prompt size drift |
-| Memory pack injection | Not sent | Included as system messages | Stable context in prefix |
-| **Compound effect** | **No cross-agent prefix hits** | **40–65% estimated prefix reuse** | |
+| Phase | Change | Effort | Prefix Cache ROI |
+|---|---|---|---|
+| **P1** | Apply `normalize_text()` to upstream message content | 2 files, ~10 lines | +30-50% |
+| **P2** | Inject canonical system prefix upstream | 1 file, ~15 lines | +20-30% |
+| **P3** | Deterministic JSON serialization for upstream | 1 file, ~20 lines | +10-20% |
+| **P4** | Agent-agnostic system prompt stripping | 1 file, ~30 lines | +10-15% |
+| **P5** | Conversation window management + memory pack injection | 2 files, ~40 lines | +5-10% |
 
----
-
-## 4. Revised Request Flow
-
-```
-Agent sends raw request
-    │
-    ▼
-[Parse + Validate]
-    │
-    ▼
-[Canonicalize Messages]
-    ├─ Normalize UUIDs/timestamps/paths
-    ├─ Sort: system first
-    ├─ Deduplicate system messages
-    ├─ Inject global system prefix (new)
-    ├─ Inject memory pack / context blocks (new)
-    └─ Truncate to max_turns (new)
-    │
-    ▼
-[Generate Cache Key]
-    ├─ Include canonical messages + quantized params
-    ├─ Redis lookup
-    └─ HIT → return cached
-    │ MISS
-    ▼
-[Build DeepSeek Payload]
-    ├─ Use canonicalized messages (CHANGED)
-    ├─ Quantize sampler parameters (CHANGED)
-    └─ Forward to DeepSeek
-    │
-    ▼
-[Store Response]
-    ├─ Redis exact cache
-    └─ Semantic cache (if enabled)
-    │
-    ▼
-[Return to agent]
-```
+**Cumulative projected DeepSeek prefix cache hit improvement**: 65-95% of eligible tokens (prompts with shared context).
 
 ---
 
-## 5. Key Metrics to Track
+## 5. Measurement & Verification
 
-| Metric | How | Current Baseline |
-|--------|-----|-----------------|
-| Upstream prompt tokens | `usage.prompt_tokens` | Per-request reporting |
-| Prefix-cache hit tokens | DeepSeek `usage.prompt_tokens_details.cached_tokens` (if available) | Not tracked |
-| Average prompt length | `stats.avg_prompt_tokens` | Not tracked |
-| Cross-agent exact hit rate | Redis hits where agent_id differs from cached entry's agent | 0% |
-| Parameter quantization efficiency | Unique cache keys before/after rounding | ~N unique / agent |
+### 5.1 Key Metrics
+
+| Metric | How to measure |
+|---|---|
+| Upstream bytes shared across requests | Log `len(payload)` and shared prefix length (computed offline) |
+| DeepSeek prefix cache tokens | DeepSeek API returns `prompt_tokens_details.cached_tokens` in usage (check API version) |
+| Local exact cache hit rate | `/v1/metrics/cache` endpoint (already implemented) |
+| Token savings per agent | `/v1/metrics/cost` endpoint (already implemented) |
+
+### 5.2 A/B Testing
+
+The gateway should support an `X-Prefix-Cache-Optimization` header to selectively enable/disable the optimization per-request for comparison.
 
 ---
 
-## 6. Implementation Order
+## 6. Key Code Changes Required
 
-| Step | Effort | Impact | Risk |
-|------|--------|--------|------|
-| 1. Send canonicalized messages upstream | 4h | Highest | Low (canonicalizer tested) |
-| 2. Inject global system prefix | 2h | High | Low (only adds, never removes) |
-| 3. Quantize sampler parameters | 1h | Medium | Low (backward-compatible cache key change) |
-| 4. Wire max_turns (default 10) | 0.5h | Medium | Low |
-| 5. Inject context blocks + memory pack | 4h | High | Medium (depends on store population) |
-| 6. Conversation summary compression | 6h | Medium | Medium (LLM call overhead) |
+### `gateway/canonicalizer.py`
+- No changes needed (already has all normalization primitives)
+
+### `gateway/router.py` (`_handle_non_streaming`)
+- Replace `proxy.chat_completion(request_data, auth_header)` with canonicalized upstream payload
+- Add `GLOBAL_SYSTEM_PREFIX` injection
+- Add deterministic JSON serialization
+
+### `gateway/proxy.py`
+- Remove JSON serialization from here (move to caller for deterministic control)
+
+### `gateway/config.py`
+- Add `max_conversation_turns` setting
+- Add `prefix_cache_enabled` toggle
+
+### `gateway/metrics.py`
+- Add `prefix_cache_shared_bytes` metric
+- Add `upstream_request_size_bytes` metric

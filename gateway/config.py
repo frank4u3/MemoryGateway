@@ -16,7 +16,15 @@ class Settings(BaseSettings):
     semantic_cache_enabled: bool = False
     semantic_cache_threshold: float = 0.98
 
+    baseline_mode: bool = False
+    canonicalizer_enabled: bool = True
+
+    authorized_agents: str = "hermes,opencode,qoder,vscode"
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+
+    def get_authorized_agents(self) -> set[str]:
+        return {a.strip() for a in self.authorized_agents.split(",") if a.strip()}
 
 
 settings = Settings()

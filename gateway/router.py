@@ -20,6 +20,18 @@ from .artifact import (
     UpdateArtifactRequest,
     UpdateArtifactResponse,
 )
+from .learning import (
+    Learning,
+    LearningResponse,
+    LearningStore,
+    LearningType,
+    SearchLearningRequest,
+    SearchLearningResponse,
+    StoreLearningRequest,
+    StoreLearningResponse,
+    UpdateLearningRequest,
+    UpdateLearningResponse,
+)
 from .memory_layer import (
     CreateMemoryRequest,
     CreateMemoryResponse,
@@ -93,12 +105,10 @@ from .models import (
 )
 from .proxy import DeepSeekProxy, DeepSeekUpstreamError
 from .stats import StatsTracker
-from .telemetry import TelemetryService
+from .telemetry import TelemetryService, TelemetryOverview
 
 logger = get_logger()
 router = APIRouter()
-
-AGENT_IDS = {"hermes", "opencode", "qoder", "vscode"}
 
 _cost_calculator = CostCalculator()
 
@@ -116,7 +126,8 @@ def _get_agent_id(request: Request) -> str:
                 }
             },
         )
-    if agent_id not in AGENT_IDS:
+    authorized = settings.get_authorized_agents()
+    if agent_id not in authorized:
         logger.warning("unknown_agent_id", extra={"agent_id": agent_id})
     return agent_id
 
@@ -188,7 +199,12 @@ async def chat_completions(
     stats: StatsTracker = request.app.state.stats
 
     request_data = body.model_dump(exclude_none=True)
-    cache_enabled = settings.cache_enabled and not _is_cache_bypass(request)
+    if settings.baseline_mode:
+        cache_enabled = False
+        if hasattr(request.app.state, "semantic_cache"):
+            semantic_cache_enabled = False
+    else:
+        cache_enabled = settings.cache_enabled and not _is_cache_bypass(request)
 
     logger.info(
         "chat_completion_request",
@@ -365,7 +381,9 @@ async def _handle_non_streaming(
     cost_spent = _cost_calculator.cost_for_tokens(prompt_tokens, completion_tokens)
     cost_spent_total.inc(cost_spent)
     await stats.record_tokens(prompt_tokens, completion_tokens)
+    await stats.record_tokens_for_agent(agent_id, prompt_tokens, completion_tokens)
     await stats.record_cost(cost_spent, 0)
+    await stats.record_cost_for_agent(agent_id, cost_spent, 0)
     await stats.record_latency(total_latency)
     response = ChatCompletionResponse(
         id=upstream_data.get("id", f"chatcmpl-{uuid.uuid4().hex[:12]}"),
@@ -601,7 +619,10 @@ async def telemetry_overview(request: Request):
 async def telemetry_agents(request: Request):
     telemetry: TelemetryService = request.app.state.telemetry
     overview = await telemetry.get_overall_summary()
-    return {"agents": [a.model_dump() for a in overview.agents]}
+    agents = sorted(
+        overview.agents, key=lambda a: a.total_tokens, reverse=True
+    )
+    return {"agents": [a.model_dump() for a in agents]}
 
 
 @router.get("/v1/telemetry/agents/{agent_id}")
@@ -612,10 +633,16 @@ async def telemetry_agent_detail(agent_id: str, request: Request):
 
 
 @router.get("/v1/telemetry/rankings")
-async def telemetry_rankings(request: Request):
+async def telemetry_rankings(
+    request: Request,
+    sort_by: str = "composite",
+):
     telemetry: TelemetryService = request.app.state.telemetry
-    rankings = await telemetry.get_agent_rankings()
-    return {"rankings": [r.model_dump() for r in rankings]}
+    valid_sorts = {"composite", "token_consumption", "cache_efficiency", "cost"}
+    if sort_by not in valid_sorts:
+        sort_by = "composite"
+    rankings = await telemetry.get_agent_rankings(sort_by=sort_by)
+    return {"rankings": [r.model_dump() for r in rankings], "sort_by": sort_by}
 
 
 @router.get("/v1/telemetry/dashboard")
@@ -638,6 +665,216 @@ def _compute_weekly_savings(daily: list[dict]) -> list[dict]:
         {"week": k, "savings": round(v, 6)}
         for k, v in sorted(weekly.items())
     ]
+
+
+# ---------------------------------------------------------------------------
+# Baseline / ROI endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/v1/telemetry/baseline")
+async def baseline_get(request: Request):
+    """Return today's live baseline snapshot."""
+    baseline_service = getattr(request.app.state, "_baseline_service", None)
+    if baseline_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "message": "Baseline service not initialized",
+                    "type": "service_unavailable",
+                    "code": "baseline_not_ready",
+                }
+            },
+        )
+    snapshot = await baseline_service.snapshot_today()
+    return snapshot or {"date": "unknown", "message": "No data collected"}
+
+
+@router.get("/v1/telemetry/baseline/export")
+async def baseline_export(request: Request, days: int = 7):
+    """Export baseline data for ROI analysis (last N days)."""
+    baseline_service = getattr(request.app.state, "_baseline_service", None)
+    if baseline_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "message": "Baseline service not initialized",
+                    "type": "service_unavailable",
+                    "code": "baseline_not_ready",
+                }
+            },
+        )
+    return await baseline_service.export_baseline(days=days)
+
+
+@router.get("/v1/telemetry/baseline/range")
+async def baseline_range(request: Request, days: int = 7):
+    """Get stored baseline records for the last N days."""
+    baseline_service = getattr(request.app.state, "_baseline_service", None)
+    if baseline_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "message": "Baseline service not initialized",
+                    "type": "service_unavailable",
+                    "code": "baseline_not_ready",
+                }
+            },
+        )
+    return await baseline_service.get_baseline_range(days=days)
+
+
+@router.post("/v1/telemetry/baseline/snapshot")
+async def baseline_snapshot(request: Request):
+    """Store today's data as a permanent baseline snapshot."""
+    baseline_service = getattr(request.app.state, "_baseline_service", None)
+    if baseline_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "message": "Baseline service not initialized",
+                    "type": "service_unavailable",
+                    "code": "baseline_not_ready",
+                }
+            },
+        )
+    snapshot = await baseline_service.snapshot_today()
+    if snapshot is None:
+        return {"status": "no_data", "message": "No telemetry data to snapshot"}
+    return {"status": "stored", "snapshot": snapshot}
+
+
+@router.post("/v1/telemetry/baseline/finalize")
+async def baseline_finalize(request: Request):
+    """Freeze all current daily snapshots as a permanent named baseline.
+
+    Body: {"baseline_id": "week1"}
+
+    Aggregates every daily snapshot into one frozen record for
+    permanent comparison. Call this at the end of baseline collection
+    so future optimizations compare against a fixed reference point.
+    """
+    baseline_service = getattr(request.app.state, "_baseline_service", None)
+    if baseline_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "message": "Baseline service not initialized",
+                    "type": "service_unavailable",
+                    "code": "baseline_not_ready",
+                }
+            },
+        )
+
+    try:
+        body = await request.json()
+        baseline_id = body.get("baseline_id", "").strip() if body else ""
+    except Exception:
+        baseline_id = ""
+
+    if not baseline_id:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": {
+                    "message": "baseline_id is required in request body",
+                    "type": "validation_error",
+                    "code": "missing_baseline_id",
+                }
+            },
+        )
+
+    result = await baseline_service.finalize(baseline_id)
+    if result is None:
+        return {"status": "no_data", "message": "No daily snapshots to finalize"}
+    return {"status": "finalized", **result}
+
+
+@router.get("/v1/telemetry/baseline/finalized")
+async def baseline_list_finalized(request: Request):
+    """List all finalized baseline IDs."""
+    baseline_service = getattr(request.app.state, "_baseline_service", None)
+    if baseline_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "message": "Baseline service not initialized",
+                    "type": "service_unavailable",
+                    "code": "baseline_not_ready",
+                }
+            },
+        )
+    ids = await baseline_service.list_finalized()
+    return {"baselines": ids}
+
+
+@router.get("/v1/telemetry/baseline/finalized/{baseline_id}")
+async def baseline_get_finalized(baseline_id: str, request: Request):
+    """Get a previously finalized baseline by ID."""
+    baseline_service = getattr(request.app.state, "_baseline_service", None)
+    if baseline_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "message": "Baseline service not initialized",
+                    "type": "service_unavailable",
+                    "code": "baseline_not_ready",
+                }
+            },
+        )
+    result = await baseline_service.get_finalized(baseline_id)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": {
+                    "message": f"Baseline '{baseline_id}' not found",
+                    "type": "not_found",
+                    "code": "baseline_not_found",
+                }
+            },
+        )
+    return result
+
+
+@router.get("/v1/telemetry/baseline/compare/{baseline_id}")
+async def baseline_compare(baseline_id: str, request: Request):
+    """Compare current day's stats against a frozen baseline.
+
+    Returns absolute deltas and percentage change for tokens and cost.
+    """
+    baseline_service = getattr(request.app.state, "_baseline_service", None)
+    if baseline_service is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "message": "Baseline service not initialized",
+                    "type": "service_unavailable",
+                    "code": "baseline_not_ready",
+                }
+            },
+        )
+    result = await baseline_service.compare_to_finalized(baseline_id)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": {
+                    "message": f"Baseline '{baseline_id}' not found",
+                    "type": "not_found",
+                    "code": "baseline_not_found",
+                }
+            },
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -686,6 +923,288 @@ async def memory_current(request: Request):
         file_count=len(pack.files),
         files={f.filename: f.content for f in pack.files},
     )
+
+
+# ---------------------------------------------------------------------------
+# Memory Pack Auto-Maintenance endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.post("/v1/memory/pack/generate")
+async def memory_pack_generate(request: Request):
+    """Trigger memory pack regeneration. Accepts optional JSON body with trigger_type.
+
+    Body: {"trigger_type": "git_commit|doc_change|arch_change|dep_change|manual"}
+    Without a body, forces manual regeneration.
+    """
+    from gateway.memory.auto_maintenance import AutoMaintenanceService
+
+    service: AutoMaintenanceService = getattr(
+        request.app.state, "_auto_maintenance_service", None
+    )
+    if service is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "message": "Auto-maintenance service not initialized",
+                    "type": "service_unavailable",
+                    "code": "maintenance_not_ready",
+                }
+            },
+        )
+
+    trigger_type = "manual"
+    force = True
+    try:
+        body = await request.json()
+        if body and isinstance(body, dict):
+            tt = body.get("trigger_type", "").strip()
+            if tt:
+                trigger_type = tt
+                force = False
+    except Exception:
+        pass
+
+    try:
+        if force:
+            version_id = await service.generate_now(trigger_type=trigger_type)
+        else:
+            version_id = await service.handle_trigger(trigger_type)
+    except Exception as exc:
+        logger.error(
+            "memory_pack_generate_failed",
+            extra={"error": str(exc)},
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": {
+                    "message": f"Memory pack generation failed: {exc}",
+                    "type": "internal_error",
+                    "code": "generation_failed",
+                }
+            },
+        )
+
+    if version_id is None:
+        return {
+            "version_id": None,
+            "trigger_type": trigger_type,
+            "message": "Memory pack generation skipped (throttled or trigger disabled)",
+        }
+
+    return {
+        "version_id": version_id,
+        "trigger_type": trigger_type,
+        "message": "Memory pack generated successfully",
+    }
+
+
+@router.get("/v1/memory/pack/versions")
+async def memory_pack_list_versions(request: Request):
+    """List all memory pack versions."""
+    from gateway.memory.versioning import MemoryPackVersioning
+
+    versioning: MemoryPackVersioning = getattr(
+        request.app.state, "_memory_pack_versioning", None
+    )
+    if versioning is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "message": "Memory pack versioning not initialized",
+                    "type": "service_unavailable",
+                    "code": "versioning_not_ready",
+                }
+            },
+        )
+
+    versions = versioning.list_versions()
+    current_id = versioning.get_current_version_id()
+    return {
+        "versions": versions,
+        "current_version": current_id,
+        "total": len(versions),
+    }
+
+
+@router.get("/v1/memory/pack/versions/{version_id}")
+async def memory_pack_get_version(version_id: str, request: Request):
+    """Get a specific version's content."""
+    from gateway.memory.versioning import MemoryPackVersioning
+
+    versioning: MemoryPackVersioning = getattr(
+        request.app.state, "_memory_pack_versioning", None
+    )
+    if versioning is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "message": "Memory pack versioning not initialized",
+                    "type": "service_unavailable",
+                    "code": "versioning_not_ready",
+                }
+            },
+        )
+
+    mpv = versioning.get_version(version_id)
+    if mpv is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": {
+                    "message": f"Version '{version_id}' not found",
+                    "type": "not_found",
+                    "code": "version_not_found",
+                }
+            },
+        )
+
+    return {
+        "version_id": mpv.version_id,
+        "manifest": mpv.manifest,
+        "files": mpv.read_all_files(),
+    }
+
+
+@router.get("/v1/memory/pack/diff/{version_id}")
+async def memory_pack_diff(version_id: str, request: Request):
+    """Get diff between a version and current."""
+    from gateway.memory.versioning import MemoryPackVersioning
+
+    versioning: MemoryPackVersioning = getattr(
+        request.app.state, "_memory_pack_versioning", None
+    )
+    if versioning is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "message": "Memory pack versioning not initialized",
+                    "type": "service_unavailable",
+                    "code": "versioning_not_ready",
+                }
+            },
+        )
+
+    current = versioning.get_current()
+    if current is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": {
+                    "message": "No current memory pack found",
+                    "type": "not_found",
+                    "code": "no_current_pack",
+                }
+            },
+        )
+
+    target = versioning.get_version(version_id)
+    if target is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": {
+                    "message": f"Version '{version_id}' not found",
+                    "type": "not_found",
+                    "code": "version_not_found",
+                }
+            },
+        )
+
+    from gateway.memory.diff import diff_packs
+
+    report = diff_packs(
+        old_files=target.read_all_files(),
+        new_files=current.read_all_files(),
+        from_version=version_id,
+        to_version=current.version_id,
+    )
+
+    return report.model_dump()
+
+
+@router.post("/v1/memory/pack/rollback/{version_id}")
+async def memory_pack_rollback(version_id: str, request: Request):
+    """Rollback to a previous version."""
+    from gateway.memory.auto_maintenance import AutoMaintenanceService
+
+    service: AutoMaintenanceService = getattr(
+        request.app.state, "_auto_maintenance_service", None
+    )
+    if service is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "message": "Auto-maintenance service not initialized",
+                    "type": "service_unavailable",
+                    "code": "maintenance_not_ready",
+                }
+            },
+        )
+
+    success = await service.rollback(version_id)
+    if not success:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": {
+                    "message": f"Version '{version_id}' not found",
+                    "type": "not_found",
+                    "code": "version_not_found",
+                }
+            },
+        )
+
+    return {
+        "version_id": version_id,
+        "message": f"Rolled back to version {version_id}",
+    }
+
+
+@router.get("/v1/memory/pack/current")
+async def memory_pack_current(request: Request):
+    """Get the current memory pack content."""
+    from gateway.memory.versioning import MemoryPackVersioning
+
+    versioning: MemoryPackVersioning = getattr(
+        request.app.state, "_memory_pack_versioning", None
+    )
+    if versioning is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "message": "Memory pack versioning not initialized",
+                    "type": "service_unavailable",
+                    "code": "versioning_not_ready",
+                }
+            },
+        )
+
+    current = versioning.get_current()
+    if current is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": {
+                    "message": "No current memory pack found",
+                    "type": "not_found",
+                    "code": "no_current_pack",
+                }
+            },
+        )
+
+    return {
+        "version_id": current.version_id,
+        "manifest": current.manifest,
+        "files": current.read_all_files(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -892,6 +1411,139 @@ async def artifact_search(body: SearchArtifactRequest, request: Request):
         results=results,
         query=body.query,
         total_hits=len(results),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Learning endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.post("/v1/learning/store", response_model=StoreLearningResponse)
+async def learning_store(body: StoreLearningRequest, request: Request):
+    store: LearningStore = request.app.state.learning_store
+    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    learning = Learning(
+        id=uuid.uuid4().hex[:16],
+        type=body.type,
+        title=body.title,
+        content=body.content,
+        source_issue=body.source_issue,
+        resolved_by=body.resolved_by,
+        tags=body.tags,
+        project=body.project,
+        created_at=now,
+        updated_at=now,
+        version=1,
+    )
+    saved = await store.save(learning)
+    if not saved:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": {
+                    "message": "Failed to store learning",
+                    "type": "internal_error",
+                    "code": "learning_store_failed",
+                }
+            },
+        )
+    return StoreLearningResponse(
+        id=learning.id,
+        type=learning.type,
+        title=learning.title,
+        version=learning.version,
+        message="Learning stored",
+    )
+
+
+@router.post("/v1/learning/update", response_model=UpdateLearningResponse)
+async def learning_update(body: UpdateLearningRequest, request: Request):
+    store: LearningStore = request.app.state.learning_store
+
+    updates = {}
+    if body.type is not None:
+        updates["type"] = body.type
+    if body.title is not None:
+        updates["title"] = body.title
+    if body.content is not None:
+        updates["content"] = body.content
+    if body.source_issue is not None:
+        updates["source_issue"] = body.source_issue
+    if body.resolved_by is not None:
+        updates["resolved_by"] = body.resolved_by
+    if body.tags is not None:
+        updates["tags"] = body.tags
+    if body.project is not None:
+        updates["project"] = body.project
+
+    learning = await store.update(body.id, **updates)
+    if learning is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": {
+                    "message": f"Learning '{body.id}' not found",
+                    "type": "not_found",
+                    "code": "learning_not_found",
+                }
+            },
+        )
+
+    return UpdateLearningResponse(
+        id=learning.id,
+        version=learning.version,
+        message="Learning updated",
+    )
+
+
+@router.post("/v1/learning/search", response_model=SearchLearningResponse)
+async def learning_search(body: SearchLearningRequest, request: Request):
+    store: LearningStore = request.app.state.learning_store
+
+    results = await store.search(
+        query=body.query,
+        type_filter=body.type_filter,
+        top_k=body.top_k,
+        use_semantic=body.use_semantic,
+    )
+
+    return SearchLearningResponse(
+        results=results,
+        query=body.query,
+        total_hits=len(results),
+    )
+
+
+@router.get("/v1/learning/{learning_id}", response_model=LearningResponse)
+async def learning_get(learning_id: str, request: Request):
+    store: LearningStore = request.app.state.learning_store
+    learning = await store.get(learning_id)
+
+    if learning is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": {
+                    "message": f"Learning '{learning_id}' not found",
+                    "type": "not_found",
+                    "code": "learning_not_found",
+                }
+            },
+        )
+
+    return LearningResponse(
+        id=learning.id,
+        type=learning.type,
+        title=learning.title,
+        content=learning.content,
+        source_issue=learning.source_issue,
+        resolved_by=learning.resolved_by,
+        tags=learning.tags,
+        project=learning.project,
+        created_at=learning.created_at,
+        updated_at=learning.updated_at,
+        version=learning.version,
     )
 
 

@@ -757,3 +757,289 @@ def _detect_naming(ctx: _Context) -> dict[str, list[str]]:
     return {
         k: sorted(set(v))[:10] for k, v in conventions.items()
     }
+
+
+# ---------------------------------------------------------------------------
+# AI-powered Memory Pack Generator
+# ---------------------------------------------------------------------------
+
+import asyncio
+import json as _json
+import subprocess
+from typing import Optional
+
+import httpx
+
+from gateway.config import settings
+from gateway.logger import get_logger as _get_logger
+
+_pack_logger = _get_logger()
+
+# The four files the auto-maintenance system tracks
+AUTO_PACK_FILES = [
+    "architecture.md",
+    "roadmap.md",
+    "current_state.md",
+    "active_tasks.md",
+]
+
+
+class MemoryPackGenerator:
+    """Generates memory pack content using the gateway's own DeepSeek proxy.
+
+    This is self-referential: the gateway calls its own /v1/chat/completions
+    endpoint to generate updated memory pack files.
+    """
+
+    def __init__(
+        self,
+        gateway_base_url: str = f"http://localhost:{settings.gateway_port}",
+        auth_token: str = "",
+    ):
+        self._base_url = gateway_base_url.rstrip("/")
+        self._auth_token = auth_token or "auto"
+
+    # ---- Public API ----
+
+    async def generate(
+        self,
+        repo_path: str = ".",
+        previous_files: Optional[dict[str, str]] = None,
+        git_diff_summary: str = "",
+        project_structure: str = "",
+    ) -> dict[str, str]:
+        """Generate all four memory pack files using the AI proxy.
+
+        Returns {filename: content} for the four auto pack files.
+        """
+        _pack_logger.info("memory_pack_generator_start")
+
+        # Gather context
+        git_info = self._get_git_info(repo_path)
+        if not project_structure:
+            project_structure = self._get_project_structure(repo_path)
+        if not git_diff_summary:
+            git_diff_summary = self._get_git_diff_summary(repo_path)
+
+        # Build the generation prompt
+        system_prompt = self._build_system_prompt()
+        user_prompt = self._build_user_prompt(
+            project_structure=project_structure,
+            git_diff_summary=git_diff_summary,
+            git_info=git_info,
+            previous_files=previous_files or {},
+        )
+
+        # Call the gateway's own chat completions endpoint
+        try:
+            content = await self._call_proxy(system_prompt, user_prompt)
+        except Exception as exc:
+            _pack_logger.error(
+                "memory_pack_generator_proxy_error",
+                extra={"error": str(exc)},
+            )
+            raise
+
+        # Parse the response into separate files
+        files = self._parse_response(content)
+        _pack_logger.info(
+            "memory_pack_generator_complete",
+            extra={"files_generated": list(files.keys())},
+        )
+        return files
+
+    # ---- Git helpers ----
+
+    def _get_git_info(self, repo_path: str) -> dict:
+        """Get recent git commit info."""
+        info = {"recent_commits": [], "current_sha": "", "branch": ""}
+        try:
+            result = subprocess.run(
+                ["git", "log", "--oneline", "-10"],
+                capture_output=True, text=True, cwd=repo_path, timeout=10,
+            )
+            if result.returncode == 0:
+                info["recent_commits"] = [
+                    line.strip() for line in result.stdout.strip().splitlines()
+                    if line.strip()
+                ]
+        except Exception:
+            pass
+
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True, text=True, cwd=repo_path, timeout=10,
+            )
+            if result.returncode == 0:
+                info["current_sha"] = result.stdout.strip()
+        except Exception:
+            pass
+
+        try:
+            result = subprocess.run(
+                ["git", "branch", "--show-current"],
+                capture_output=True, text=True, cwd=repo_path, timeout=10,
+            )
+            if result.returncode == 0:
+                info["branch"] = result.stdout.strip()
+        except Exception:
+            pass
+
+        return info
+
+    def _get_git_diff_summary(self, repo_path: str) -> str:
+        """Get a summary of recent changes."""
+        try:
+            result = subprocess.run(
+                ["git", "diff", "--stat", "HEAD~1", "HEAD"],
+                capture_output=True, text=True, cwd=repo_path, timeout=10,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception:
+            pass
+        return "No recent diff available."
+
+    def _get_project_structure(self, repo_path: str) -> str:
+        """Get a summary of the project file structure."""
+        try:
+            root = Path(repo_path).resolve()
+            lines = []
+            skip = {".git", "__pycache__", "node_modules", ".venv", "venv", ".tox"}
+            for entry in sorted(root.rglob("*")):
+                if any(part in skip for part in entry.parts):
+                    continue
+                if entry.is_file():
+                    try:
+                        rel = str(entry.relative_to(root))
+                        if len(rel) < 120:
+                            lines.append(rel)
+                    except Exception:
+                        pass
+                if len(lines) > 200:
+                    lines.append("... (truncated)")
+                    break
+            return "\n".join(lines)
+        except Exception:
+            return "Unable to scan project structure."
+
+    # ---- Prompt building ----
+
+    def _build_system_prompt(self) -> str:
+        return (
+            "You are a technical documentation assistant. "
+            "Generate memory pack files for a software project. "
+            "Return EXACTLY four markdown files separated by the marker "
+            "---FILE:filename.md--- on its own line. "
+            "The four files must be: architecture.md, roadmap.md, "
+            "current_state.md, active_tasks.md. "
+            "Each file must be valid markdown. Be concise but thorough. "
+            "Do not include any text outside the file markers."
+        )
+
+    def _build_user_prompt(
+        self,
+        project_structure: str,
+        git_diff_summary: str,
+        git_info: dict,
+        previous_files: dict[str, str],
+    ) -> str:
+        parts = [
+            "Generate updated memory pack files for this project.",
+            "",
+            "## Project Structure",
+            "```",
+            project_structure[:3000],
+            "```",
+            "",
+            "## Recent Git Changes",
+            "```",
+            git_diff_summary[:2000],
+            "```",
+            "",
+            f"## Current Branch: {git_info.get('branch', 'unknown')}",
+            f"## Current Commit: {git_info.get('current_sha', 'unknown')[:12]}",
+            "",
+            "## Recent Commits",
+        ]
+        for commit in git_info.get("recent_commits", [])[:10]:
+            parts.append(f"- {commit}")
+
+        if previous_files:
+            parts.append("")
+            parts.append("## Previous Memory Pack Content (for reference)")
+            for fn, content in previous_files.items():
+                parts.append(f"### {fn}")
+                parts.append("```")
+                parts.append(content[:1500])
+                parts.append("```")
+
+        parts.append("")
+        parts.append(
+            "Now generate the four memory pack files. "
+            "Use the marker ---FILE:filename.md--- before each file."
+        )
+        return "\n".join(parts)
+
+    # ---- Proxy call ----
+
+    async def _call_proxy(self, system_prompt: str, user_prompt: str) -> str:
+        """Call the gateway's own /v1/chat/completions endpoint."""
+        payload = {
+            "model": "deepseek-chat",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "max_tokens": 4096,
+            "temperature": 0.2,
+        }
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self._auth_token}",
+            "X-Agent-ID": "hermes",
+        }
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{self._base_url}/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        choices = data.get("choices", [])
+        if not choices:
+            raise RuntimeError("Empty response from proxy")
+
+        return choices[0].get("message", {}).get("content", "")
+
+    # ---- Response parsing ----
+
+    def _parse_response(self, content: str) -> dict[str, str]:
+        """Parse the AI response into separate files."""
+        files: dict[str, str] = {}
+        current_file = None
+        current_lines = []
+
+        for line in content.splitlines():
+            if line.startswith("---FILE:") and line.endswith("---"):
+                if current_file and current_lines:
+                    files[current_file] = "\n".join(current_lines).strip()
+                current_file = line[len("---FILE:"):-len("---")].strip()
+                current_lines = []
+            else:
+                current_lines.append(line)
+
+        if current_file and current_lines:
+            files[current_file] = "\n".join(current_lines).strip()
+
+        # Ensure all expected files exist (even if empty)
+        for fn in AUTO_PACK_FILES:
+            if fn not in files:
+                files[fn] = f"# {fn.replace('.md', '').replace('_', ' ').title()}\n\n*Auto-generation did not produce this file.*"
+
+        return files

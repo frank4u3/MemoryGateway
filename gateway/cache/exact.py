@@ -61,10 +61,15 @@ class ExactCache:
         await self.redis.setex(key, ttl or self._default_ttl, serialized)
 
     async def delete(self, pattern: str = "exact:*") -> int:
-        keys = await self.redis.keys(pattern)
-        if keys:
-            return await self.redis.delete(*keys)
-        return 0
+        cursor = 0
+        deleted = 0
+        while True:
+            cursor, keys = await self.redis.scan(cursor, match=pattern, count=100)
+            if keys:
+                deleted += await self.redis.delete(*keys)
+            if cursor == 0:
+                break
+        return deleted
 
     async def exists(self, key: str) -> bool:
         return await self.redis.exists(key) > 0
@@ -73,8 +78,14 @@ class ExactCache:
         return await self.redis.ttl(key)
 
     async def size(self) -> int:
-        keys = await self.redis.keys("exact:*")
-        return len(keys)
+        cursor = 0
+        count = 0
+        while True:
+            cursor, keys = await self.redis.scan(cursor, match="exact:*", count=100)
+            count += len(keys)
+            if cursor == 0:
+                break
+        return count
 
     async def ping(self) -> float:
         start = time.monotonic()

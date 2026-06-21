@@ -1,3 +1,4 @@
+import json as _json
 import time
 import uuid
 from datetime import datetime
@@ -116,16 +117,7 @@ _cost_calculator = CostCalculator()
 def _get_agent_id(request: Request) -> str:
     agent_id = (request.headers.get("X-Agent-ID") or "").strip().lower()
     if not agent_id:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "error": {
-                    "message": "X-Agent-ID header is required",
-                    "type": "invalid_request_error",
-                    "code": "missing_agent_id",
-                }
-            },
-        )
+        return "unknown"
     authorized = settings.get_authorized_agents()
     if agent_id not in authorized:
         logger.warning("unknown_agent_id", extra={"agent_id": agent_id})
@@ -134,7 +126,7 @@ def _get_agent_id(request: Request) -> str:
 
 def _get_auth_header(request: Request) -> str:
     auth = request.headers.get("Authorization", "")
-    if not auth and not settings.deepseek_api_key:
+    if not auth:
         raise HTTPException(
             status_code=401,
             detail={
@@ -199,6 +191,7 @@ async def chat_completions(
     stats: StatsTracker = request.app.state.stats
 
     request_data = body.model_dump(exclude_none=True)
+    request_data["model"] = _normalize_model(request_data.get("model", "deepseek-v4-flash"))
     if settings.baseline_mode:
         cache_enabled = False
         if hasattr(request.app.state, "semantic_cache"):
@@ -385,6 +378,16 @@ async def _handle_non_streaming(
     await stats.record_cost(cost_spent, 0)
     await stats.record_cost_for_agent(agent_id, cost_spent, 0)
     await stats.record_latency(total_latency)
+
+    if settings.baseline_mode:
+        upstream_data.pop("x_gateway", None)
+        for choice in upstream_data.get("choices", []):
+            msg = choice.get("message") or {}
+            rc = msg.pop("reasoning_content", None)
+            if rc and not msg.get("content", ""):
+                msg["content"] = rc
+        return upstream_data
+
     response = ChatCompletionResponse(
         id=upstream_data.get("id", f"chatcmpl-{uuid.uuid4().hex[:12]}"),
         object="chat.completion",
@@ -451,18 +454,19 @@ def _handle_streaming(
                     "agent_id": agent_id,
                 },
             )
+            yield f"data: {_json.dumps({'error': {'message': e.body[:200], 'type': 'upstream_error', 'code': str(e.status_code)}})}\n\n".encode()
         except Exception as e:
             logger.error(
                 "upstream_stream_error",
                 extra={"error": str(e), "agent_id": agent_id},
             )
+            yield f"data: {_json.dumps({'error': {'message': str(e)[:200], 'type': 'internal_error', 'code': 'stream_error'}})}\n\n".encode()
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
     )

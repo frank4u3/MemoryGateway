@@ -40,6 +40,10 @@ class MemoryRecord(BaseModel):
     creator_agent: str = ""
     created_at: str = ""
     updated_at: str = ""
+    decay_score: float = 1.0
+    importance_score: float = 1.0
+    access_count: int = 0
+    last_accessed: str = ""
 
 
 class ShareMemoryRequest(BaseModel):
@@ -101,6 +105,10 @@ class MemorySearchResult(BaseModel):
     created_at: str = ""
     updated_at: str = ""
     score: float = 0.0
+    decay_score: float = 1.0
+    importance_score: float = 1.0
+    access_count: int = 0
+    last_accessed: str = ""
 
 
 class SearchMemoryResponse(BaseModel):

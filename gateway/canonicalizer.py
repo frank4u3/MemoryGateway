@@ -85,6 +85,31 @@ class CanonicalPrompt:
     canonical_hash: str
 
 
+@dataclass
+class CanonicalRequest:
+    model: str
+    messages: list[dict]
+    temperature: float | None
+    max_tokens: int | None
+    top_p: float | None
+    presence_penalty: float | None
+    frequency_penalty: float | None
+    canonical_messages: list[dict]
+    canonical_text: str
+    canonical_hash: str
+    cache_key: str
+    prefix_hash: str
+    system_hash: str
+    tools_hash: str
+    history_hash: str
+    prefix_messages: list[dict]
+    upstream_messages: list[dict]
+    tail: dict | None
+    effective_prefix_tokens: int = 0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+
+
 def _path_replacer(m: re.Match) -> str:
     path = m.group(0)
 
@@ -310,3 +335,57 @@ def generate_cache_key_params(
         frequency_penalty=frequency_penalty,
     )
     return f"exact:{result.canonical_hash}"
+
+
+def canonicalize_request(
+    messages: list[dict],
+    model: str = "deepseek-chat",
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    top_p: float | None = None,
+    presence_penalty: float | None = None,
+    frequency_penalty: float | None = None,
+    system_prefix: list[dict] | None = None,
+    max_turns: int | None = None,
+    max_history: int = 20,
+) -> CanonicalRequest:
+    from gateway.prefix_cache.builder import build_prefix as _build_prefix
+
+    cp = canonicalize_prompt(
+        messages=messages,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        top_p=top_p,
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
+        system_prefix=system_prefix,
+        max_turns=max_turns,
+    )
+    cache_key = f"exact:{cp.canonical_hash}"
+
+    upstream = build_upstream_messages(
+        messages, system_prefix=system_prefix, max_turns=max_turns
+    )
+    prefix_info = _build_prefix(messages, max_history=max_history)
+
+    return CanonicalRequest(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        top_p=top_p,
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
+        canonical_messages=cp.canonical_messages,
+        canonical_text=cp.canonical_text,
+        canonical_hash=cp.canonical_hash,
+        cache_key=cache_key,
+        prefix_hash=prefix_info["prefix_hash"],
+        system_hash=prefix_info["system_hash"],
+        tools_hash=prefix_info["tools_hash"],
+        history_hash=prefix_info["history_hash"],
+        prefix_messages=prefix_info["prefix_messages"],
+        upstream_messages=upstream,
+        tail=prefix_info.get("tail"),
+    )

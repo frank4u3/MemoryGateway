@@ -1,4 +1,5 @@
 import json
+import math
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -19,6 +20,9 @@ from gateway.memory_layer.schemas import (
 logger = get_logger()
 
 AGENT_IDS = {"hermes", "opencode", "qoder", "vscode"}
+
+DECAY_HALF_LIFE_DAYS = 90.0
+DECAY_LAMBDA = math.log(2) / DECAY_HALF_LIFE_DAYS
 
 
 class MemoryLayerStore:
@@ -82,6 +86,38 @@ class MemoryLayerStore:
         except (json.JSONDecodeError, ValueError) as exc:
             logger.error("memory_layer_deserialize_error", extra={"error": str(exc)})
             return None
+
+    @staticmethod
+    def _compute_decay(created_at: str) -> float:
+        try:
+            created = datetime.strptime(created_at[:10], "%Y-%m-%d")
+            days = (datetime.utcnow() - created).days
+            return math.exp(-DECAY_LAMBDA * max(days, 0))
+        except Exception:
+            return 1.0
+
+    def _final_score(self, record: MemoryRecord, keyword_score: float) -> float:
+        recency = min(1.0, max(0.1, record.decay_score))
+        importance = max(0.1, record.importance_score)
+        boost = min(2.0, 1.0 + (record.access_count * 0.05))
+        return round(keyword_score * importance * recency * boost, 4)
+
+    async def record_access(self, record_id: str, agent_id: str):
+        if self._redis is None:
+            return
+        try:
+            raw = await self._redis.get(self._key_for(record_id))
+            if raw is None:
+                return
+            record = self._deserialize(raw)
+            if record is None:
+                return
+            record.access_count += 1
+            record.last_accessed = self._now()
+            record.decay_score = self._compute_decay(record.created_at)
+            await self._redis.set(self._key_for(record_id), self._serialize(record))
+        except Exception as exc:
+            logger.warning("memory_layer_access_error", extra={"error": str(exc)})
 
     def _check_permission(
         self, record: MemoryRecord, agent_id: str, required: MemoryPermission = MemoryPermission.read
@@ -198,6 +234,10 @@ class MemoryLayerStore:
             creator_agent=creator_agent or resolved_agent,
             created_at=now,
             updated_at=now,
+            decay_score=1.0,
+            importance_score=1.0,
+            access_count=0,
+            last_accessed="",
         )
 
         try:
@@ -264,6 +304,10 @@ class MemoryLayerStore:
             creator_agent=creator_agent,
             created_at=now,
             updated_at=now,
+            decay_score=1.0,
+            importance_score=1.0,
+            access_count=0,
+            last_accessed="",
         )
         inline_key = f"mem_layer:inline:{record_id}"
 
@@ -314,7 +358,10 @@ class MemoryLayerStore:
             return None
 
     async def get_record(self, record_id: str) -> Optional[MemoryRecord]:
-        return await self._get_record(record_id)
+        record = await self._get_record(record_id)
+        if record is not None:
+            await self.record_access(record_id, "")
+        return record
 
     async def update_permissions(
         self, record_id: str, permissions: dict[str, MemoryPermission], agent_id: str
@@ -411,9 +458,11 @@ class MemoryLayerStore:
             if project_filter and record.source_project != project_filter:
                 continue
 
-            score = self._score_record(record, q) if q else 1.0
-            if q and score <= 0:
+            kw_score = self._score_record(record, q) if q else 1.0
+            if q and kw_score <= 0:
                 continue
+
+            fin_score = self._final_score(record, kw_score)
 
             results.append(
                 MemorySearchResult(
@@ -430,7 +479,11 @@ class MemoryLayerStore:
                     creator_agent=record.creator_agent,
                     created_at=record.created_at,
                     updated_at=record.updated_at,
-                    score=round(score, 4),
+                    score=round(fin_score, 4),
+                    decay_score=round(record.decay_score, 4),
+                    importance_score=round(record.importance_score, 4),
+                    access_count=record.access_count,
+                    last_accessed=record.last_accessed,
                 )
             )
 
@@ -508,6 +561,10 @@ class MemoryLayerStore:
                     created_at=record.created_at,
                     updated_at=record.updated_at,
                     score=1.0,
+                    decay_score=round(record.decay_score, 4),
+                    importance_score=round(record.importance_score, 4),
+                    access_count=record.access_count,
+                    last_accessed=record.last_accessed,
                 )
             )
         return results

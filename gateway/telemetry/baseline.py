@@ -113,9 +113,12 @@ class BaselineService:
         total_prompt = 0
         total_completion = 0
         total_cost = 0.0
+        total_cost_spent = 0.0
+        total_cost_saved = 0.0
         total_hits = 0
         total_misses = 0
         total_saved = 0
+        total_provider_calls = 0
 
         agents: dict[str, dict] = {}
 
@@ -125,9 +128,12 @@ class BaselineService:
             total_completion += day.get("tokens_completion", 0)
             total_tokens += day.get("total_tokens", 0)
             total_cost += day.get("net_cost_usd", 0)
+            total_cost_spent += day.get("cost_spent_usd", 0)
+            total_cost_saved += day.get("cost_saved_usd", 0)
             total_hits += day.get("hits", 0)
             total_misses += day.get("misses", 0)
             total_saved += day.get("tokens_saved", 0)
+            total_provider_calls += day.get("provider_calls", 0)
 
             for agent_id, adata in day.get("agents", {}).items():
                 if agent_id not in agents:
@@ -152,7 +158,10 @@ class BaselineService:
             "tokens_completion": total_completion,
             "total_tokens": total_tokens,
             "tokens_saved": total_saved,
+            "cost_spent_usd": round(total_cost_spent, 8),
+            "cost_saved_usd": round(total_cost_saved, 8),
             "net_cost_usd": round(total_cost, 8),
+            "provider_calls": total_provider_calls,
             "agents": agents,
         }
 
@@ -165,8 +174,12 @@ class BaselineService:
                 "tokens_prompt": d.get("tokens_prompt", 0),
                 "tokens_completion": d.get("tokens_completion", 0),
                 "total_tokens": d.get("total_tokens", 0),
+                "tokens_saved": d.get("tokens_saved", 0),
                 "cost_spent_usd": d.get("cost_spent_usd", 0),
+                "cost_saved_usd": d.get("cost_saved_usd", 0),
                 "hits": d.get("hits", 0),
+                "misses": d.get("misses", 0),
+                "provider_calls": d.get("provider_calls", 0),
             }
             for d in days
         ]
@@ -263,8 +276,9 @@ class BaselineService:
     ) -> dict | None:
         """Compare current live stats against a frozen baseline.
 
-        Returns a comparison dict with absolute deltas and percentage changes
-        for tokens and cost — the business metrics that matter.
+        Returns a comparison dict with deltas for tokens, cost, cache hits,
+        and cache savings — broken out so cache-specific savings are visible
+        separate from natural usage variation.
         """
         if self._redis is None:
             return None
@@ -277,14 +291,43 @@ class BaselineService:
 
         f_totals = frozen.get("totals", {})
         f_days = frozen.get("days_collected", 1)
+
         f_tokens = f_totals.get("total_tokens", 0)
         f_cost = f_totals.get("net_cost_usd", 0)
+        f_saved = f_totals.get("tokens_saved", 0)
+        f_hits = f_totals.get("hits", 0)
+        f_misses = f_totals.get("misses", 0)
+        f_cost_spent = f_totals.get("cost_spent_usd", 0)
+        f_cost_saved = f_totals.get("cost_saved_usd", 0)
 
         t_tokens = today.get("total_tokens", 0)
         t_cost = today.get("net_cost_usd", 0)
+        t_saved = today.get("tokens_saved", 0)
+        t_hits = today.get("hits", 0)
+        t_misses = today.get("misses", 0)
+        t_cost_spent = today.get("cost_spent_usd", 0)
+        t_cost_saved = today.get("cost_saved_usd", 0)
 
-        token_delta = t_tokens - (f_tokens / f_days if f_days > 0 else 0)
-        cost_delta = t_cost - (f_cost / f_days if f_days > 0 else 0)
+        def _avg(v): return v / f_days if f_days > 0 else 0
+
+        f_avg_tokens = _avg(f_tokens)
+        f_avg_cost = _avg(f_cost)
+        f_avg_saved = _avg(f_saved)
+        f_avg_hits = _avg(f_hits)
+        f_avg_misses = _avg(f_misses)
+        f_avg_cost_spent = _avg(f_cost_spent)
+        f_avg_cost_saved = _avg(f_cost_saved)
+
+        token_delta = t_tokens - f_avg_tokens
+        cost_delta = t_cost - f_avg_cost
+        cache_token_delta = t_saved - f_avg_saved
+        cache_cost_delta = t_cost_saved - f_avg_cost_saved
+        spent_delta = t_cost_spent - f_avg_cost_spent
+
+        t_total = t_hits + t_misses
+        t_hit_rate = round(t_hits / t_total * 100, 1) if t_total > 0 else 0.0
+        f_avg_total = f_avg_hits + f_avg_misses
+        f_hit_rate = round(f_avg_hits / f_avg_total * 100, 1) if f_avg_total > 0 else 0.0
 
         return {
             "baseline_id": baseline_id,
@@ -292,13 +335,34 @@ class BaselineService:
                 "total_tokens": f_tokens,
                 "cost_usd": round(f_cost, 8),
                 "days": f_days,
+                "daily_avg": {
+                    "total_tokens": round(f_avg_tokens, 0),
+                    "cost_spent_usd": round(f_avg_cost_spent, 8),
+                    "tokens_saved": round(f_avg_saved, 0),
+                    "cost_saved_usd": round(f_avg_cost_saved, 8),
+                    "hits": round(f_avg_hits, 1),
+                    "misses": round(f_avg_misses, 1),
+                    "hit_rate_pct": f_hit_rate,
+                },
             },
             "current": {
                 "total_tokens": t_tokens,
-                "cost_usd": round(t_cost, 8),
+                "cost_spent_usd": round(t_cost_spent, 8),
+                "tokens_saved": t_saved,
+                "cost_saved_usd": round(t_cost_saved, 8),
+                "hits": t_hits,
+                "misses": t_misses,
+                "hit_rate_pct": t_hit_rate,
             },
             "delta": {
-                "tokens": round(token_delta, 0),
-                "cost_usd": round(cost_delta, 8),
+                "total_tokens": round(token_delta, 0),
+                "total_tokens_pct": round(token_delta / f_avg_tokens * 100, 1) if f_avg_tokens > 0 else 0.0,
+                "cost_spent_usd": round(spent_delta, 8),
+                "cost_spent_pct": round(spent_delta / f_avg_cost_spent * 100, 1) if f_avg_cost_spent > 0 else 0.0,
+            },
+            "cache_attribution": {
+                "tokens_saved": round(cache_token_delta, 0),
+                "cost_saved_usd": round(cache_cost_delta, 8),
+                "hit_rate_pct_delta": round(t_hit_rate - f_hit_rate, 1),
             },
         }

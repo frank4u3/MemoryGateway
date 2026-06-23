@@ -119,3 +119,30 @@ python -m pytest tests/ -v                     # full suite
 - `RECOVERY_PLAN.md` — per-file triage: Rebuild/Drop/Ask Frank
 - `regression-core.diff` — 135 lines, applied in commit 8f3369d
 - `regression-extras.diff` — 1691 lines, NOT applied (new files: debug, patterns, decisions, prefix_cache, HANDOFF)
+
+## In Progress / Next Action
+
+**Session ended**: 2026-06-21
+**Completed**: Pushed 7 commits including all 5 recovery commits to
+GitHub frank4u3/MemoryGateway master. Code is now off-site safe.
+
+**GitHub status**: origin/master is now current with local master.
+
+**Untracked files NOT pushed** (scope creep, kept local only):
+gateway/debug/, gateway/patterns/, gateway/decisions/,
+gateway/prefix_cache/, _start.vbs, AUDIT.md, RECOVERY_PLAN.md,
+STASH_REPORT.md, regression diffs
+
+**Next action**: Wait for Frank and claude.ai session to design
+proper two-repo VPS deployment setup (memory-gateway and agent-platform
+as separate git clones on VPS host, volume-mounted into containers).
+Do not make further code changes until that setup is confirmed.
+
+**Open questions for Frank**:
+- VPS /opt/ deployment structure: when does the VPS get proper
+  git clones set up from GitHub?
+- Should the scope-creep untracked dirs be deleted from local disk,
+  or kept for reference?
+
+**Known issues**: VPS container still has isolated git with no remote.
+That will be resolved when proper VPS deployment is set up.

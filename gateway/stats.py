@@ -39,6 +39,8 @@ class StatsTracker:
         self.redis = redis
 
     async def record_request(self, agent_id: str) -> None:
+        if self.redis is None:
+            return
         today = _today()
         pipe = self.redis.pipeline()
         pipe.incr(REQUESTS_KEY)
@@ -47,6 +49,7 @@ class StatsTracker:
         await pipe.execute()
 
     async def record_hit(self, agent_id: str, tokens_saved: int) -> None:
+        if self.redis is None: return
         today = _today()
         pipe = self.redis.pipeline()
         pipe.incr(HITS_KEY)
@@ -58,6 +61,7 @@ class StatsTracker:
         await pipe.execute()
 
     async def record_miss(self, agent_id: str) -> None:
+        if self.redis is None: return
         today = _today()
         pipe = self.redis.pipeline()
         pipe.incr(MISSES_KEY)
@@ -68,6 +72,7 @@ class StatsTracker:
     async def record_tokens(
         self, prompt_tokens: int, completion_tokens: int
     ) -> None:
+        if self.redis is None: return
         today = _today()
         pipe = self.redis.pipeline()
         pipe.incrby(TOKENS_PROMPT_KEY, prompt_tokens)

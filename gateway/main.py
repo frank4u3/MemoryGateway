@@ -38,12 +38,20 @@ async def lifespan(app: FastAPI):
         },
     )
 
-    redis_client = aioredis.from_url(
-        settings.redis_url,
-        decode_responses=True,
-    )
-    cache = ExactCache(redis_client, ttl=settings.cache_ttl_seconds)
-    stats = StatsTracker(redis_client)
+    if settings.redis_url and settings.redis_url.strip():
+        redis_client = aioredis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+        )
+        cache = ExactCache(redis_client, ttl=settings.cache_ttl_seconds)
+        stats = StatsTracker(redis_client)
+        app.state.redis = redis_client
+    else:
+        logger.info("no_redis_url", extra={"detail": "running without Redis (baseline/fail-open mode)"})
+        redis_client = None
+        cache = None
+        stats = StatsTracker(None)
+        app.state.redis = None
 
     if not hasattr(app.state, "proxy") or app.state.proxy is None:
         http_client = httpx.AsyncClient(
@@ -53,7 +61,6 @@ async def lifespan(app: FastAPI):
         app.state.proxy = DeepSeekProxy(http_client)
         app.state._own_proxy = True
 
-    app.state.redis = redis_client
     app.state.cache = cache
     app.state.stats = stats
 
@@ -177,7 +184,8 @@ async def lifespan(app: FastAPI):
         await app.state._memory_pack_watcher.stop()
     if getattr(app.state, "_own_proxy", False) and hasattr(app.state, "proxy"):
         await app.state.proxy.client.aclose()
-    await redis_client.aclose()
+    if redis_client:
+        await redis_client.aclose()
     logger.info("gateway_shutdown")
 
 

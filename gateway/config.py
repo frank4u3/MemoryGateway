@@ -21,7 +21,7 @@ class Settings(BaseSettings):
 
     authorized_agents: str = "hermes,opencode,qoder,vscode"
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     def get_authorized_agents(self) -> set[str]:
         return {a.strip() for a in self.authorized_agents.split(",") if a.strip()}

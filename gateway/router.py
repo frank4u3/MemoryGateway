@@ -1,7 +1,14 @@
-import json as _json
+﻿import json as _json
+import re
 import time
 import uuid
 from datetime import datetime
+
+# Pre-compiled regex for DSML parameter parsing (using workaround to avoid agent parsing)
+_re_param = re.compile(
+    r'<parameter\s+name=["\']([^"\']+)["\'][^>]*>(.*?)</parameter>',
+    re.DOTALL,
+)
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -138,11 +145,16 @@ def _get_auth_header(request: Request) -> str:
             },
         )
     return auth
-
-
 def _is_cache_bypass(request: Request) -> bool:
     val = request.headers.get("X-Cache-Bypass", "").strip().lower()
     return val in ("true", "1", "yes")
+
+
+def _normalize_model(model: str) -> str:
+    """Normalize model names to DeepSeek API format."""
+    return model
+
+
 
 
 @router.get("/v1/health")
@@ -431,6 +443,32 @@ async def _handle_non_streaming(
     return response.model_dump(exclude_none=True)
 
 
+def _dsml_to_openai_tool_call(text: str) -> list[dict]:
+    """Parse complete DSML tool_calls block. Returns list of OpenAI tool call dicts."""
+    results = []
+    for idx, m in enumerate(re.finditer(
+        r'<｜｜DSML｜｜invoke\s+name=["\']([^"\']+)["\']>(.*?)</｜｜DSML｜｜invoke>',
+        text,
+        re.DOTALL,
+    )):
+        tool_name = m.group(1)
+        args = {}
+        for pm in re.finditer(
+            r'<｜｜DSML｜｜parameter\s+name=["\']([^"\']+)["\'][^>]*>(.*?)</｜｜DSML｜｜parameter>',
+            m.group(2),
+            re.DOTALL,
+        ):
+            args[pm.group(1)] = pm.group(2).strip()
+        results.append({
+            "index": idx,
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "arguments": _json.dumps(args) if args else "{}",
+            },
+        })
+    return results
+
 def _handle_streaming(
     request_data: dict,
     auth_header: str,
@@ -440,11 +478,81 @@ def _handle_streaming(
     request_data = {**request_data, "stream": True}
 
     async def event_generator():
+        dsml_buffer = ""
+        in_dsml = False
         try:
             async for chunk in proxy.chat_completion_stream(
                 request_data, auth_header
             ):
-                yield chunk
+                decoded = chunk.decode("utf-8", errors="replace")
+                new_lines = []
+
+                for line in decoded.split("\n"):
+                    import sys; print("[UPSTREAM]", repr(line[:300]), file=sys.stderr, flush=True)
+                    if not line.startswith("data: "):
+                        new_lines.append(line)
+                        continue
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]":
+                        new_lines.append(line)
+                        continue
+                    try:
+                        data = _json.loads(data_str)
+                        choices = data.get("choices", [])
+                        emitted = False
+                        for choice in choices:
+                            delta = choice.get("delta", {})
+                            content = delta.get("content", "") or ""
+
+                            # Accumulate DSML blocks
+                            if in_dsml or "<｜｜DSML｜｜" in content:
+                                in_dsml = True
+                                dsml_buffer += content
+                                # Only flush when the OUTER closing tag arrives
+                                if "</｜｜DSML｜｜tool_calls>" in dsml_buffer:
+                                    tool_calls = _dsml_to_openai_tool_call(dsml_buffer)
+                                    if tool_calls:
+                                        tool_chunk = {
+                                            "id": data.get("id", ""),
+                                            "object": "chat.completion.chunk",
+                                            "created": data.get("created", 0),
+                                            "model": data.get("model", ""),
+                                            "choices": [{
+                                                "index": 0,
+                                                "delta": {"content": None, "tool_calls": tool_calls},
+                                                "finish_reason": None,
+                                            }]
+                                        }
+                                        print("[TOOLCALL JSON]", _json.dumps(tool_chunk, indent=2), file=sys.stderr, flush=True)
+                                        new_lines.append("data: " + _json.dumps(tool_chunk))
+                                        finish_chunk = {
+                                            "id": data.get("id", ""),
+                                            "object": "chat.completion.chunk",
+                                            "created": data.get("created", 0),
+                                            "model": data.get("model", ""),
+                                            "choices": [{
+                                                "index": 0,
+                                                "delta": {},
+                                                "finish_reason": "tool_calls",
+                                            }]
+                                        }
+                                        print("[FINISH JSON]", _json.dumps(finish_chunk, indent=2), file=sys.stderr, flush=True)
+                                        new_lines.append("data: " + _json.dumps(finish_chunk))
+                                    dsml_buffer = ""
+                                    in_dsml = False
+                                emitted = True
+                                # suppress partial DSML chunks — do not append line
+
+                        if not emitted:
+                            new_lines.append(line)
+
+                    except _json.JSONDecodeError:
+                        new_lines.append(line)
+
+                lines = "\n".join(new_lines)
+                print("[DOWNSTREAM]", repr(lines[:300]), file=sys.stderr, flush=True)
+                yield lines.encode("utf-8")
+
         except DeepSeekUpstreamError as e:
             logger.error(
                 "upstream_stream_error",
@@ -454,13 +562,17 @@ def _handle_streaming(
                     "agent_id": agent_id,
                 },
             )
-            yield f"data: {_json.dumps({'error': {'message': e.body[:200], 'type': 'upstream_error', 'code': str(e.status_code)}})}\n\n".encode()
+            err_line = f"data: {_json.dumps({'error': {'message': e.body[:200], 'type': 'upstream_error', 'code': str(e.status_code)}})}\n\n"
+            print("[DOWNSTREAM]", repr(err_line[:300]), file=sys.stderr, flush=True)
+            yield err_line.encode()
         except Exception as e:
             logger.error(
                 "upstream_stream_error",
                 extra={"error": str(e), "agent_id": agent_id},
             )
-            yield f"data: {_json.dumps({'error': {'message': str(e)[:200], 'type': 'internal_error', 'code': 'stream_error'}})}\n\n".encode()
+            err_line = f"data: {_json.dumps({'error': {'message': str(e)[:200], 'type': 'internal_error', 'code': 'stream_error'}})}\n\n"
+            print("[DOWNSTREAM]", repr(err_line[:300]), file=sys.stderr, flush=True)
+            yield err_line.encode()
 
     return StreamingResponse(
         event_generator(),

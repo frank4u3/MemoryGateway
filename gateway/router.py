@@ -469,6 +469,10 @@ def _dsml_to_openai_tool_call(text: str) -> list[dict]:
         })
     return results
 
+def _sse(payload: dict) -> str:
+    return f"data: {_json.dumps(payload)}\n\n"
+
+
 def _handle_streaming(
     request_data: dict,
     auth_header: str,
@@ -478,101 +482,56 @@ def _handle_streaming(
     request_data = {**request_data, "stream": True}
 
     async def event_generator():
-        dsml_buffer = ""
+        DSML_START = "<function_calls>"
+        DSML_END = "</function_calls>"
+        dsml_buffer = []
         in_dsml = False
-        try:
-            async for chunk in proxy.chat_completion_stream(
-                request_data, auth_header
-            ):
-                decoded = chunk.decode("utf-8", errors="replace")
-                new_lines = []
+        tool_emitted = False
+        stream_done = False
 
-                for line in decoded.split("\n"):
-                    import sys; print("[UPSTREAM]", repr(line[:300]), file=sys.stderr, flush=True)
-                    if not line.startswith("data: "):
-                        new_lines.append(line)
-                        continue
-                    data_str = line[6:]
-                    if data_str.strip() == "[DONE]":
-                        new_lines.append(line)
-                        continue
-                    try:
-                        data = _json.loads(data_str)
-                        choices = data.get("choices", [])
-                        emitted = False
-                        for choice in choices:
-                            delta = choice.get("delta", {})
-                            content = delta.get("content", "") or ""
+        async for chunk in proxy.chat_completion_stream(request_data, auth_header):
+            data_str = chunk.decode("utf-8")
+            data = _json.loads(data_str)
+            delta = data["choices"][0].get("delta", {})
+            content = delta.get("content", "")
 
-                            # Accumulate DSML blocks
-                            if in_dsml or "<｜｜DSML｜｜" in content:
-                                in_dsml = True
-                                dsml_buffer += content
-                                # Only flush when the OUTER closing tag arrives
-                                if "</｜｜DSML｜｜tool_calls>" in dsml_buffer:
-                                    tool_calls = _dsml_to_openai_tool_call(dsml_buffer)
-                                    if tool_calls:
-                                        tool_chunk = {
-                                            "id": data.get("id", ""),
-                                            "object": "chat.completion.chunk",
-                                            "created": data.get("created", 0),
-                                            "model": data.get("model", ""),
-                                            "choices": [{
-                                                "index": 0,
-                                                "delta": {"content": None, "tool_calls": tool_calls},
-                                                "finish_reason": None,
-                                            }]
-                                        }
-                                        print("[TOOLCALL JSON]", _json.dumps(tool_chunk, indent=2), file=sys.stderr, flush=True)
-                                        new_lines.append("data: " + _json.dumps(tool_chunk))
-                                        finish_chunk = {
-                                            "id": data.get("id", ""),
-                                            "object": "chat.completion.chunk",
-                                            "created": data.get("created", 0),
-                                            "model": data.get("model", ""),
-                                            "choices": [{
-                                                "index": 0,
-                                                "delta": {},
-                                                "finish_reason": "tool_calls",
-                                            }]
-                                        }
-                                        print("[FINISH JSON]", _json.dumps(finish_chunk, indent=2), file=sys.stderr, flush=True)
-                                        new_lines.append("data: " + _json.dumps(finish_chunk))
-                                    dsml_buffer = ""
-                                    in_dsml = False
-                                emitted = True
-                                # suppress partial DSML chunks — do not append line
+            if DSML_START in content:
+                in_dsml = True
+                dsml_buffer = []
+                continue
 
-                        if not emitted:
-                            new_lines.append(line)
+            if in_dsml:
+                dsml_buffer.append(content)
+                if DSML_END in content:
+                    in_dsml = False
+                    full_dsml = "".join(dsml_buffer)
+                    dsml_buffer = []
+                    if not tool_emitted:
+                        tool_emitted = True
+                        tool_calls = _dsml_to_openai_tool_call(full_dsml)
+                        yield _sse({
+                            "id": data.get("id"),
+                            "object": "chat.completion.chunk",
+                            "choices": [{"index": 0, "delta": {"tool_calls": tool_calls}}]
+                        })
+                    continue
 
-                    except _json.JSONDecodeError:
-                        new_lines.append(line)
+            if content and not in_dsml:
+                yield _sse({
+                    "id": data.get("id"),
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"content": content}}]
+                })
 
-                lines = "\n".join(new_lines)
-                print("[DOWNSTREAM]", repr(lines[:300]), file=sys.stderr, flush=True)
-                yield lines.encode("utf-8")
+            if data["choices"][0].get("finish_reason") is not None:
+                stream_done = True
 
-        except DeepSeekUpstreamError as e:
-            logger.error(
-                "upstream_stream_error",
-                extra={
-                    "status": e.status_code,
-                    "body": e.body,
-                    "agent_id": agent_id,
-                },
-            )
-            err_line = f"data: {_json.dumps({'error': {'message': e.body[:200], 'type': 'upstream_error', 'code': str(e.status_code)}})}\n\n"
-            print("[DOWNSTREAM]", repr(err_line[:300]), file=sys.stderr, flush=True)
-            yield err_line.encode()
-        except Exception as e:
-            logger.error(
-                "upstream_stream_error",
-                extra={"error": str(e), "agent_id": agent_id},
-            )
-            err_line = f"data: {_json.dumps({'error': {'message': str(e)[:200], 'type': 'internal_error', 'code': 'stream_error'}})}\n\n"
-            print("[DOWNSTREAM]", repr(err_line[:300]), file=sys.stderr, flush=True)
-            yield err_line.encode()
+        if stream_done:
+            yield _sse({
+                "id": None,
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls" if tool_emitted else "stop"}]
+            })
 
     return StreamingResponse(
         event_generator(),

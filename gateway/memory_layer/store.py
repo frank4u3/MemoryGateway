@@ -437,7 +437,14 @@ class MemoryLayerStore:
         if self._redis is None:
             return []
 
-        record_ids = await self._redis.smembers(self.KEY_IDS)
+        record_ids = set()
+        cursor = 0
+        while True:
+            cursor, batch = await self._redis.sscan(self.KEY_IDS, cursor)
+            record_ids.update(batch)
+            if cursor == 0:
+                break
+
         if not record_ids:
             return []
 
@@ -534,7 +541,14 @@ class MemoryLayerStore:
         if self._redis is None:
             return []
 
-        record_ids = await self._redis.smembers(self.KEY_IDS)
+        record_ids = set()
+        cursor = 0
+        while True:
+            cursor, batch = await self._redis.sscan(self.KEY_IDS, cursor)
+            record_ids.update(batch)
+            if cursor == 0:
+                break
+
         if not record_ids:
             return []
 
@@ -573,8 +587,14 @@ class MemoryLayerStore:
         if self._redis is None:
             return []
         try:
-            raw = await self._redis.smembers(self._agent_key(agent_id))
-            return sorted(raw)
+            ids = set()
+            cursor = 0
+            while True:
+                cursor, batch = await self._redis.sscan(self._agent_key(agent_id), cursor)
+                ids.update(batch)
+                if cursor == 0:
+                    break
+            return sorted(ids)
         except Exception:
             return []
 
@@ -594,7 +614,14 @@ class MemoryLayerStore:
         if self._redis is None:
             return
         try:
-            ids_raw = await self._redis.smembers(self.KEY_IDS) or set()
+            ids_raw = set()
+            cursor = 0
+            while True:
+                cursor, batch = await self._redis.sscan(self.KEY_IDS, cursor)
+                ids_raw.update(batch)
+                if cursor == 0:
+                    break
+
             pipe = self._redis.pipeline()
             for rid in ids_raw:
                 record = await self._get_record(rid)

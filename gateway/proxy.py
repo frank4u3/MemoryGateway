@@ -20,15 +20,26 @@ class DeepSeekProxy:
     def __init__(self, client: httpx.AsyncClient):
         self.client = client
         self.base_url = settings.deepseek_base_url
+        self._api_key = settings.deepseek_api_key
+
+    def _resolve_key(self, auth_header: str) -> str:
+        key = (auth_header or "").removeprefix("Bearer ").strip()
+        if not key and self._api_key:
+            logger.debug("proxy_fallback_to_config_api_key")
+        return key or self._api_key
+
+    def _build_headers(self, auth_header: str) -> dict:
+        key = self._resolve_key(auth_header)
+        return {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        }
 
     async def chat_completion(
         self, request_data: dict, auth_header: str
     ) -> tuple[dict, float]:
         start = time.monotonic()
-        headers = {
-            "Authorization": auth_header,
-            "Content-Type": "application/json",
-        }
+        headers = self._build_headers(auth_header)
         response = await self.client.post(
             f"{self.base_url}/chat/completions",
             headers=headers,
@@ -50,10 +61,8 @@ class DeepSeekProxy:
     async def chat_completion_stream(
         self, request_data: dict, auth_header: str
     ) -> AsyncIterator[bytes]:
-        headers = {
-            "Authorization": auth_header,
-            "Content-Type": "application/json",
-        }
+        headers = self._build_headers(auth_header)
+        print("[GATEWAY][PROXY] STREAM REQUEST SENT TO DEEPSEEK")
         async with self.client.stream(
             "POST",
             f"{self.base_url}/chat/completions",
@@ -75,4 +84,7 @@ class DeepSeekProxy:
                 )
 
             async for chunk in response.aiter_bytes():
+                print("[GATEWAY][PROXY] UPSTREAM CHUNK RECEIVED")
+                print(chunk)
                 yield chunk
+        print("[GATEWAY][PROXY] STREAM CLOSED")

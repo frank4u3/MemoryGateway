@@ -469,8 +469,308 @@ def _dsml_to_openai_tool_call(text: str) -> list[dict]:
         })
     return results
 
-def _sse(payload: dict) -> str:
-    return f"data: {_json.dumps(payload)}\n\n"
+_FORBIDDEN_IN_DELTA = {"reasoning_content", "tool_calls", "logprobs", "metadata", "provider_fingerprint"}
+
+
+class SSESerializer:
+    """Single outbound SSE serializer. Strips forbidden fields. Never throws."""
+
+    ALLOWED_DELTA = {"content", "role"}
+    FORBIDDEN_PREFIX = ("provider", "metadata", "fingerprint")
+
+    def emit(self, payload: dict) -> str:
+        safe = self._sanitize(payload)
+        return f"data: {_json.dumps(safe)}\n\n"
+
+    def _sanitize(self, payload: dict) -> dict:
+        safe = {}
+        for k, v in payload.items():
+            if k == "choices" and isinstance(v, list):
+                safe["choices"] = [self._sanitize_choice(c) for c in v]
+            elif k in ("id", "object", "created", "model"):
+                safe[k] = v
+            else:
+                self._log_dropped(k)
+        return safe
+
+    def _sanitize_choice(self, choice: dict) -> dict:
+        safe = {}
+        for k, v in choice.items():
+            if k == "delta" and isinstance(v, dict):
+                safe["delta"] = self._sanitize_delta(v)
+            elif k in ("index", "finish_reason"):
+                safe[k] = v
+            else:
+                self._log_dropped(k)
+        return safe
+
+    def _sanitize_delta(self, delta: dict) -> dict:
+        safe = {}
+        for k, v in delta.items():
+            if k in self.ALLOWED_DELTA:
+                safe[k] = v
+            elif any(k.startswith(p) for p in self.FORBIDDEN_PREFIX):
+                self._log_dropped(k)
+            elif k in _FORBIDDEN_IN_DELTA:
+                self._log_dropped(k)
+            else:
+                pass  # silently drop unknown delta fields
+        return safe
+
+    def _log_dropped(self, key: str):
+        logger.warning("[SSE] stripped forbidden field: %s", key)
+
+
+_sse_serializer = SSESerializer()
+
+
+# Layer 1 — SSEFrameDecoder: bytes → framed messages
+class StreamFrame:
+    def __init__(self, type, payload=None):
+        self.type = type
+        self.payload = payload
+
+
+# ── Strongly typed event objects ─────────────────────────────────────────────
+
+class StreamDelta:
+    """Carries text content from upstream to client."""
+    __slots__ = ("content",)
+    def __init__(self, content: str):
+        self.content = content or ""
+
+
+class StreamDone:
+    """Signals stream termination."""
+    __slots__ = ()
+
+
+class StreamError:
+    """Malformed or unparseable upstream frame. Never crashes the stream."""
+    __slots__ = ("detail",)
+    def __init__(self, detail: str = ""):
+        self.detail = detail
+
+
+class ToolInvocation:
+    """Complete tool call reconstructed from streaming deltas."""
+    __slots__ = ("name", "arguments")
+    def __init__(self, name: str, arguments: dict | str):
+        self.name = name
+        self.arguments = arguments
+
+
+class CacheHit:
+    """Response served from cache — used for metrics/telemetry."""
+    __slots__ = ("tokens_saved",)
+    def __init__(self, tokens_saved: int = 0):
+        self.tokens_saved = tokens_saved
+
+
+class CacheMiss:
+    """Cache miss — response was fetched from upstream."""
+    __slots__ = ()
+
+
+class MemoryRecall:
+    """Memory entry retrieved from store — context injection."""
+    __slots__ = ("content", "source")
+    def __init__(self, content: str = "", source: str = ""):
+        self.content = content
+        self.source = source
+
+
+class MemoryWrite:
+    """Memory entry to persist after the request completes."""
+    __slots__ = ("content", "tags")
+    def __init__(self, content: str = "", tags: list[str] | None = None):
+        self.content = content
+        self.tags = tags or []
+
+
+# ── Layer 1 — SSEFrameDecoder: bytes → StreamFrame objects ─────────────────
+
+class SSEFrameDecoder:
+    def __init__(self):
+        self.buffer = ""
+
+    def feed(self, chunk: str) -> list[StreamFrame]:
+        self.buffer += chunk
+        frames = []
+        while "\n" in self.buffer:
+            line, self.buffer = self.buffer.split("\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("data:"):
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    frames.append(StreamFrame("done"))
+                else:
+                    frames.append(StreamFrame("data", payload))
+            elif line.startswith("{"):
+                frames.append(StreamFrame("data", line))
+        return frames
+
+
+# ── Layer 2 — StreamNormalizer: frames → typed events ──────────────────────
+
+class StreamNormalizer:
+    def normalize(self, frame: StreamFrame) -> StreamDelta | StreamDone | StreamError | ToolInvocation:
+        if frame.type == "done":
+            return StreamDone()
+        if frame.type != "data":
+            return StreamError(f"unexpected frame type: {frame.type}")
+        try:
+            obj = _json.loads(frame.payload)
+            if "choices" in obj:
+                delta = obj["choices"][0].get("delta", {})
+                if delta.get("tool_calls"):
+                    tc = delta["tool_calls"][0].get("function", {})
+                    name = tc.get("name")
+                    args = tc.get("arguments", "")
+                    return ToolInvocation(name=name, arguments=args)
+                return StreamDelta(delta.get("content") or "")
+            logger.warning("[NORM] unexpected payload shape: %s", frame.payload[:200])
+            return StreamError("unexpected payload shape")
+        except Exception as exc:
+            logger.warning("[NORM] json parse failure: %s | payload: %s", exc, frame.payload[:200])
+            return StreamError("json parse failure")
+
+
+# ── Layer 3 — DSMLStateMachine: per-request state ──────────────────────────
+
+class DSMLStateMachine:
+    """Tracks streaming content. Returns ToolInvocation or StreamDelta on finalize."""
+
+    def __init__(self):
+        self.buffer_content: list[str] = []
+        self.tool_call_active = False
+        self.tool_call = {"name": "", "arguments": ""}
+
+    def ingest(self, delta: StreamDelta) -> StreamDelta | None:
+        if not delta.content:
+            return None
+        self.buffer_content.append(delta.content)
+        return StreamDelta(delta.content)
+
+    def ingest_tool_call(self, name: str, arguments_chunk: str):
+        self.tool_call_active = True
+        self.tool_call["name"] = name or self.tool_call["name"]
+        self.tool_call["arguments"] += arguments_chunk or ""
+        return None
+
+    def finalize(self) -> "ToolInvocation | StreamDelta":
+        if self.tool_call_active:
+            try:
+                args = _json.loads(self.tool_call["arguments"]) if self.tool_call["arguments"] else {}
+            except Exception:
+                args = {"raw": self.tool_call["arguments"]}
+            return ToolInvocation(name=self.tool_call["name"], arguments=args)
+        return StreamDelta("".join(self.buffer_content))
+
+
+# ── Layer 3 — DSMLEventBus: validates + routes typed events ────────────────
+
+class DSMLEventBus:
+    def __init__(self):
+        self.sm = DSMLStateMachine()
+
+    def ingest(self, event: StreamDelta | StreamDone | StreamError | ToolInvocation) -> StreamDelta | ToolInvocation | None:
+        if isinstance(event, StreamError):
+            logger.warning("[DSML] malformed event ignored")
+            return None
+        if isinstance(event, StreamDone):
+            return None  # handled in finally block
+        if isinstance(event, ToolInvocation):
+            self.sm.ingest_tool_call(event.name, event.arguments)
+            return event
+        if isinstance(event, StreamDelta):
+            return self.sm.ingest(event)
+        return None
+
+    def finalize(self) -> ToolInvocation | StreamDelta:
+        return self.sm.finalize()
+
+
+# ── Layer 4 — RouterCore: typed-event → SSE payload ────────────────────────
+
+class RouterCore:
+    def process(self, event: StreamDelta | StreamDone | ToolInvocation | StreamError) -> dict | None:
+        if isinstance(event, StreamDelta):
+            return {"emit": event.content}
+        if isinstance(event, StreamDone):
+            return None  # handled in pipeline finally
+        if isinstance(event, ToolInvocation):
+            return {"tool_call": {"name": event.name, "arguments": event.arguments if isinstance(event.arguments, dict) else {"raw": event.arguments}}}
+        if isinstance(event, StreamError):
+            logger.warning("[ROUTER] StreamError: %s", event.detail)
+            return None
+        return None
+
+
+class RequestContext:
+    """Per-request observability context. One instance per request."""
+
+    def __init__(self, request_id: str, agent_id: str, provider: str = "deepseek"):
+        self.request_id = request_id
+        self.agent_id = agent_id
+        self.provider = provider
+        self.started_at = time.monotonic()
+        self.tool_count = 0
+        self.cache_hit = False
+        self.memory_hits = 0
+        self.termination_reason = ""
+
+    def log_summary(self):
+        elapsed = (time.monotonic() - self.started_at) * 1000
+        logger.info(
+            "request_completed",
+            extra={
+                "request_id": self.request_id,
+                "agent_id": self.agent_id,
+                "provider": self.provider,
+                "latency_ms": round(elapsed, 1),
+                "cache_hit": self.cache_hit,
+                "memory_hits": self.memory_hits,
+                "tool_count": self.tool_count,
+                "termination_reason": self.termination_reason or "stop",
+            },
+        )
+
+
+async def stream_pipeline(upstream, request_id: str, agent_id: str):
+    decoder = SSEFrameDecoder()
+    normalizer = StreamNormalizer()
+    bus = DSMLEventBus()
+    router = RouterCore()
+    ctx = RequestContext(request_id=request_id, agent_id=agent_id)
+
+    try:
+        async for chunk in upstream:
+            for frame in decoder.feed(chunk.decode("utf-8")):
+                event = normalizer.normalize(frame)
+                dsml = bus.ingest(event)
+                if isinstance(dsml, ToolInvocation):
+                    continue
+                out = router.process(dsml)
+                if out is None:
+                    continue
+                if out.get("emit"):
+                    yield _sse_serializer.emit({"id": None, "object": "chat.completion.chunk",
+                                "choices": [{"index": 0, "delta": {"content": out["emit"]}}]})
+    except Exception as e:
+        ctx.termination_reason = "error"
+        logger.warning("[STREAM] error: %s", e)
+    finally:
+        final = bus.finalize()
+        if isinstance(final, ToolInvocation):
+            ctx.tool_count += 1
+            logger.warning("[TOOL] tool call intercepted, not exposed: %s(%s)", final.name, final.arguments)
+        ctx.termination_reason = ctx.termination_reason or ("tool" if ctx.tool_count else "stop")
+        yield _sse_serializer.emit({"id": None, "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": ctx.termination_reason}]})
+        ctx.log_summary()
 
 
 def _handle_streaming(
@@ -480,67 +780,17 @@ def _handle_streaming(
     proxy: DeepSeekProxy,
 ):
     request_data = {**request_data, "stream": True}
-
-    async def event_generator():
-        DSML_START = "<function_calls>"
-        DSML_END = "</function_calls>"
-        dsml_buffer = []
-        in_dsml = False
-        tool_emitted = False
-        stream_done = False
-
-        async for chunk in proxy.chat_completion_stream(request_data, auth_header):
-            data_str = chunk.decode("utf-8")
-            data = _json.loads(data_str)
-            delta = data["choices"][0].get("delta", {})
-            content = delta.get("content", "")
-
-            if DSML_START in content:
-                in_dsml = True
-                dsml_buffer = []
-                continue
-
-            if in_dsml:
-                dsml_buffer.append(content)
-                if DSML_END in content:
-                    in_dsml = False
-                    full_dsml = "".join(dsml_buffer)
-                    dsml_buffer = []
-                    if not tool_emitted:
-                        tool_emitted = True
-                        tool_calls = _dsml_to_openai_tool_call(full_dsml)
-                        yield _sse({
-                            "id": data.get("id"),
-                            "object": "chat.completion.chunk",
-                            "choices": [{"index": 0, "delta": {"tool_calls": tool_calls}}]
-                        })
-                    continue
-
-            if content and not in_dsml:
-                yield _sse({
-                    "id": data.get("id"),
-                    "object": "chat.completion.chunk",
-                    "choices": [{"index": 0, "delta": {"content": content}}]
-                })
-
-            if data["choices"][0].get("finish_reason") is not None:
-                stream_done = True
-
-        if stream_done:
-            yield _sse({
-                "id": None,
-                "object": "chat.completion.chunk",
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls" if tool_emitted else "stop"}]
-            })
+    rid = uuid.uuid4().hex[:12]
 
     return StreamingResponse(
-        event_generator(),
+        stream_pipeline(proxy.chat_completion_stream(request_data, auth_header), request_id=rid, agent_id=agent_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         },
     )
+
 
 
 def _log_and_raise_upstream_error(e: DeepSeekUpstreamError, agent_id: str):
